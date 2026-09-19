@@ -1,0 +1,975 @@
+(() => {
+  'use strict';
+
+  const $ = (id) => document.getElementById(id);
+  const esc = (value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[ch]));
+  const numeric = (value) => value !== null && value !== undefined && value !== '' && Number.isFinite(Number(value));
+  const num = (value, digits = 1) => numeric(value) ? Number(value).toLocaleString('zh-CN', {minimumFractionDigits: digits, maximumFractionDigits: digits}) : '—';
+  const percent = (value) => numeric(value) ? `${Number(value) > 0 ? '+' : ''}${num(value, 2)}%` : '—';
+  const ratio = (value) => numeric(value) ? `${num(Number(value) * 100, 1)}%` : '—';
+  const clamp = (value, min = 0, max = 100) => numeric(value) ? Math.min(max, Math.max(min, Number(value))) : 0;
+  const amount = (value) => {
+    if (!numeric(value)) return '—';
+    const n = Number(value);
+    if (Math.abs(n) >= 1e8) return `${num(n / 1e8, 2)}亿`;
+    if (Math.abs(n) >= 1e4) return `${num(n / 1e4, 1)}万`;
+    return num(n, 0);
+  };
+  const tone = (value) => !numeric(value) || Number(value) === 0 ? 'neutral' : Number(value) > 0 ? 'positive' : 'negative';
+  const list = (value) => Array.isArray(value) ? value : Array.isArray(value?.rows) ? value.rows : Array.isArray(value?.items) ? value.items : [];
+  const text = (id, value) => { if ($(id)) $(id).textContent = value ?? '—'; };
+  const time = (value, full = false) => {
+    if (!value) return '—';
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+    return new Intl.DateTimeFormat('zh-CN', {timeZone: 'Asia/Shanghai', ...(full ? {month: '2-digit', day: '2-digit'} : {}), hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).format(d);
+  };
+  const dateAtShanghai = () => new Intl.DateTimeFormat('en-CA', {timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
+  const state = {snapshot: null, selected: null, filter: 'all', search: '', page: 'auction', history: [], historyKey: '', historyLastFetch: 0, historyBusy: false, connected: false, configLoaded: false, reportSignature: '', reviewDateTouched: false, watchlistSettingsDirty: false, queryRequested: '', llmProvider: '', llmDirty: false, llmSignature: '', llmSwitching: false, reports: [], reportsBusy: false, reportsMode: '', reportsGeneration: 0, reportSaveBusy: false, reportLoadBusy: false, comparisonBusy: false, comparisonGeneration: 0, diagnosticsBusy: false, diagnosticsLoaded: false};
+  let pollTimer = null;
+  let polling = false;
+  const factors = {
+    gap: {label: '开盘溢价', description: '按板别尺度归一化溢价；不直接判定涨停。', weight: .15},
+    amount: {label: '竞价金额', description: '对数处理竞价金额，衡量承接与交易活跃度。', weight: .15},
+    turnover: {label: '竞价换手', description: '观察竞价阶段参与程度，需有效换手字段。', weight: .10},
+    volume_ratio: {label: '量比强度', description: '观察相对量能水平，缺失数据不视作零。', weight: .10},
+    late_momentum: {label: '后段动量', description: '09:20 后逐批观察价格快照，重视后段确认。', weight: .20},
+    retention: {label: '量能留存', description: '观察竞价金额留存；无法代替真实撤单率。', weight: .15},
+    continuity: {label: '连板延续', description: '结合昨日连板高度，识别连续强势背景。', weight: .15},
+  };
+  const phases = {cancellable: '可撤单观察阶段', locked: '不可撤单确认阶段', firm: '不可撤单确认阶段', non_trading_day: '今日为非交易日', final: '竞价最终快照', awaiting_final: '等待最终竞价快照', waiting: '等待竞价时段', idle: '等待竞价时段', preparing: '正在准备股票池', closed: '本日竞价已结束', preopen: '等待竞价开始', collecting: '正在采集竞价', finalized: '竞价采集已完成'};
+  const statuses = {idle: '待启动', preparing: '准备股票池', ready: '已就绪', running: '监测中', scheduled: '等待开盘', waiting: '等待开盘', stopped: '已停止', completed: '已完成', finished: '已完成', finalized: '已完成', final: '已完成', error: '运行异常', demo: '模拟演示', collecting: '实时采集中', not_configured: '请配置密钥'};
+  const poolNames = {focus: '重点池：自选＋昨日涨停＋趋势强股', all: '全市场股票池', watchlist: '自选股池'};
+  const sourceNames = {manual: '自选', previous_limit_up: '昨日涨停', strong_trend: '趋势强股'};
+  const sourceTags = (sources) => list(sources).filter((source) => sourceNames[source]).map((source) => `<span class="source-tag ${esc(source)}">${esc(sourceNames[source])}</span>`).join('');
+  const sameCode = (a, b) => Boolean(a && b) && String(a).toUpperCase().split('.')[0] === String(b).toUpperCase().split('.')[0];
+  const isCollecting = (tracking) => Boolean(tracking) && ['cancellable', 'firm', 'locked'].includes(state.snapshot?.auction?.phase);
+  function trackingLabel(tracking) {
+    if (!tracking) return state.snapshot?.running === false ? '服务已停止' : '未加入当前采集池';
+    if (isCollecting(tracking)) return '竞价采集中';
+    if (['closed', 'final', 'finalized', 'awaiting_final'].includes(state.snapshot?.auction?.phase)) return '已入池，竞价窗口已结束';
+    return '已入池，等待竞价窗口';
+  }
+  function parseStockCodes(value) {
+    const codes = [...new Set(String(value || '').split(/[\s,，;；]+/).map((code) => code.trim().toUpperCase()).filter(Boolean))];
+    if (!codes.length) throw new Error('请输入股票代码，例如 600519 或 600519.SH。');
+    if (codes.length > 50) throw new Error('每批最多加入 50 只股票，请分批提交。');
+    if (codes.some((code) => !/^\d{6}(?:\.(?:SH|SZ|BJ))?$/.test(code))) throw new Error('仅支持 6 位股票代码或代码加 .SH / .SZ / .BJ，不支持名称查询。');
+    return codes;
+  }
+
+  function toast(message, isError = false) {
+    const el = document.createElement('div');
+    el.className = `toast${isError ? ' error' : ''}`;
+    el.textContent = message;
+    $('toast-container').append(el);
+    setTimeout(() => el.remove(), isError ? 10000 : 5000);
+  }
+
+  function showPage(name) {
+    if (!['auction', 'stocks', 'review', 'settings'].includes(name)) return;
+    state.page = name;
+    document.querySelectorAll('.page').forEach((el) => el.classList.toggle('active', el.id === `page-${name}`));
+    document.querySelectorAll('[data-tab]').forEach((el) => el.classList.toggle('active', el.dataset.tab === name));
+    text('page-name', {auction: '实时竞价', stocks: '个股查询', review: '收盘复盘', settings: '策略与接入'}[name]);
+    history.replaceState(null, '', `#${name}`);
+    if (name === 'auction') loadHistory();
+    if (name === 'review' && state.snapshot && !state.reportsBusy) loadReports();
+  }
+
+  async function api(path, body) {
+    const options = {method: body === undefined ? 'GET' : 'POST', credentials: 'same-origin', cache: 'no-store', headers: {Accept: 'application/json'}};
+    if (body !== undefined) {
+      options.headers['Content-Type'] = 'application/json';
+      options.headers['X-Local-App'] = 'auction-lab';
+      options.body = JSON.stringify(body);
+    }
+    const controller = new AbortController();
+    const deadline = setTimeout(() => controller.abort(), 20000);
+    options.signal = controller.signal;
+    try {
+      const response = await fetch(path, options);
+      let result;
+      try { result = await response.json(); } catch { throw new Error(`本地服务返回了无法读取的响应（${response.status}）。`); }
+      if (!response.ok || result.ok === false) throw new Error(result.message || result.error || `请求失败（${response.status}）`);
+      return result;
+    } catch (error) {
+      if (error.name === 'AbortError') throw new Error('本地服务响应超时，请检查窗口中是否仍在运行。');
+      throw error;
+    } finally { clearTimeout(deadline); }
+  }
+
+  async function mutate(path, body, successMessage, trigger) {
+    if (trigger?.disabled) return false;
+    if (trigger) trigger.disabled = true;
+    try {
+      const result = await api(path, body);
+      toast(result.message || successMessage || '已完成');
+      await fetchState();
+      return true;
+    } catch (error) { toast(error.message, true); return false; }
+    finally { if (trigger) trigger.disabled = Boolean(trigger.dataset.job && state.snapshot?.jobs?.[trigger.dataset.job]?.status === 'running'); }
+  }
+
+  function initializeWeights(weights) {
+    const known = Object.keys(factors);
+    const custom = Object.keys(weights || {}).filter((key) => !known.includes(key));
+    $('weights-editor').innerHTML = [...known, ...custom].map((key) => {
+      const f = factors[key] || {label: key, description: '自定义因子，详见策略文档。', weight: 0};
+      const value = numeric(weights?.[key]) ? Number(weights[key]) * 100 : f.weight * 100;
+      return `<div class="weight-control"><div class="weight-label"><span>${esc(f.label)}</span><span class="subtle">${esc(key)}</span></div><p>${esc(f.description)}</p><div class="weight-input"><input type="range" min="0" max="100" step="1" value="${clamp(value)}" data-weight-range="${esc(key)}" aria-label="${esc(f.label)}权重滑块"><input type="number" min="0" max="100" step="0.1" value="${num(value, 1).replace(/,/g, '')}" data-weight="${esc(key)}" aria-label="${esc(f.label)}权重百分比"><span>%</span></div></div>`;
+    }).join('');
+    updateWeightTotal();
+  }
+
+  function updateWeightTotal() {
+    const total = [...document.querySelectorAll('[data-weight]')].reduce((sum, el) => sum + (Number(el.value) || 0), 0);
+    text('weight-total', `合计 ${num(total, 1)}%`);
+  }
+
+  function hydrateConfig(snapshot) {
+    if (state.configLoaded) return;
+    const config = snapshot.config || {};
+    $('universe').value = config.universe || 'focus';
+    $('poll-seconds').value = config.poll_seconds || 3;
+    $('watchlist').value = (config.watchlist || []).join(', ');
+    initializeWeights(config.weights);
+    state.configLoaded = true;
+  }
+
+  function render(snapshot) {
+    if (!snapshot || typeof snapshot !== 'object') return;
+    state.snapshot = snapshot;
+    hydrateConfig(snapshot);
+    if (!state.watchlistSettingsDirty && document.activeElement !== $('watchlist')) $('watchlist').value = (snapshot.config?.watchlist || []).join(', ');
+    const demo = snapshot.mode === 'demo';
+    const credentialPersisted = snapshot.credential_persisted === true;
+    const credentialSource = snapshot.credential_source || snapshot.source;
+    const sessionCredential = Boolean(snapshot.configured) && (snapshot.credential_persisted === false || credentialSource === 'process');
+    document.body.dataset.mode = demo ? 'demo' : 'live';
+    $('demo-banner').classList.toggle('hidden', !demo);
+    $('setup-banner').classList.toggle('hidden', Boolean(snapshot.configured) && !sessionCredential);
+    text('setup-title', sessionCredential ? '本次会话已连接，尚未保存' : '连接数据源，开始你的竞价研究');
+    text('setup-description', sessionCredential ? '当前服务可继续读取行情。关闭服务后此连接不会保留；自行启动应用后，可在「策略与接入」保存密钥供下次使用。' : '先在「策略与接入」保存 HiThink API Key，再准备关注池并启动监测。');
+    text('setup-action', sessionCredential ? '查看接入设置 ↗' : '配置 API Key ↗');
+    text('mode-badge', demo ? 'DEMO' : 'LIVE');
+    document.querySelector('.nav-tag').textContent = demo ? 'DEMO' : 'LIVE';
+    $('mode-badge').classList.toggle('demo', demo);
+    text('credential-status', sessionCredential ? '会话已连接 · 未保存' : credentialPersisted ? '已本地保存' : snapshot.configured ? '已连接' : '待配置');
+    $('credential-status').className = `pill ${snapshot.configured && !sessionCredential ? 'green' : 'amber'}`;
+    text('sidebar-credential', sessionCredential ? '本机运行 · 仅本次会话连接' : credentialPersisted ? '本机运行 · 密钥本地保存' : '本机运行 · 密钥不回显');
+    text('credential-help', sessionCredential ? '当前密钥仅在服务进程中可用，尚未写入本机凭据文件。自行启动应用后，可保存至 %APPDATA%/hithink-finance/credentials.env 供下次使用；保存前请停止采集并等待任务结束。' : `${credentialPersisted ? '密钥已保存至' : '保存后写入'}本机用户目录 %APPDATA%/hithink-finance/credentials.env，页面不会回显。更新密钥前请先停止采集并等待任务结束。`);
+    $('api-key').placeholder = sessionCredential ? '当前密钥不回显；下次保存时输入' : credentialPersisted ? '已保存；输入新密钥以替换' : snapshot.configured ? '已连接；密钥不回显' : '输入 HiThink API Key';
+    renderLLMConfig(snapshot.llm || {}, snapshot.jobs || {});
+    text('monitor-status', demo ? '模拟演示' : statuses[snapshot.status] || snapshot.status || '等待启动');
+    text('monitor-message', snapshot.message || '等待开始采集');
+    const auction = snapshot.auction || {};
+    const rows = list(auction.rows);
+    const validCount = rows.filter((row) => numeric(row.score)).length;
+    const universeCount = auction.universe_count;
+    $('coverage-value').innerHTML = `${esc(num(validCount, 0))}<small> / ${esc(num(universeCount, 0))}</small>`;
+    const coverage = numeric(universeCount) && Number(universeCount) > 0 ? validCount / Number(universeCount) : null;
+    const pctCoverage = numeric(coverage) ? (coverage <= 1 ? coverage * 100 : coverage) : 0;
+    $('coverage-bar').style.width = `${clamp(pctCoverage)}%`;
+    text('coverage-note', numeric(universeCount) ? `已处理 ${num(auction.processed_count, 0)} 只 · 有效覆盖 ${num(pctCoverage, 1)}%` : '等待准备股票池');
+    $('cycle-value').innerHTML = `${esc(num(auction.cycle_seconds, 1))}<small> 秒</small>`;
+    const sourceCounts = auction.source_counts || {};
+    const sourceCountText = Object.keys(sourceNames).filter((key) => numeric(sourceCounts[key])).map((key) => `${sourceNames[key]} ${num(sourceCounts[key], 0)}`).join(' / ');
+    text('pool-description', `${poolNames[snapshot.config?.universe] || '重点股票池'}${sourceCountText ? ` · ${sourceCountText}（来源可重叠）` : ''}`);
+    const phase = auction.phase || auction.summary?.phase;
+    text('phase-label', demo ? '演示模式 · 模拟竞价路径' : auction.finalized ? '竞价最终排名已保留' : phase === 'non_trading_day' && !snapshot.calendar?.checked_on ? '等待交易日历校验' : phases[phase] || phase || '等待竞价时段');
+    text('phase-note', auction.finalized ? `最终观测 ${num(auction.final_count, 0)} 只 · ${auction.date || auction.summary?.session_date || ''}` : '交易日 09:15 开始，09:25 进入收尾校验');
+    const now = new Date(snapshot.now || Date.now());
+    const parts = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).formatToParts(now);
+    const part = (key) => Number(parts.find((p) => p.type === key)?.value || 0);
+    const seconds = part('hour') * 3600 + part('minute') * 60 + part('second');
+    const demoStamp = new Date(auction.summary?.last_received_at || snapshot.now || Date.now());
+    const demoParts = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).formatToParts(demoStamp);
+    const demoPart = (key) => Number(demoParts.find((p) => p.type === key)?.value || 0);
+    const demoSeconds = demoPart('hour') * 3600 + demoPart('minute') * 60 + demoPart('second');
+    const progress = phase === 'non_trading_day' ? 0 : clamp(((demo ? demoSeconds : seconds) - 33300) / 6);
+    $('timeline-progress').style.width = `${progress}%`;
+    document.querySelectorAll('.timeline-point').forEach((el, index) => el.classList.toggle('reached', (demo || phase !== 'non_trading_day') && progress >= index * 50 && (progress > 0 || seconds >= 33300)));
+    renderAuction();
+    renderStocks(snapshot.stocks || {}, snapshot.jobs || {});
+    renderReview(snapshot.review, snapshot.jobs?.review);
+    renderReportControls();
+    const reviewJobStatus = snapshot.jobs?.review?.status;
+    if (state.reviewJobStatus === 'running' && reviewJobStatus === 'done') {
+      if (state.reportsBusy) state.reportsRefreshPending = true;
+      else loadReports();
+    }
+    state.reviewJobStatus = reviewJobStatus;
+    if (state.reportsMode !== snapshot.mode) loadReports();
+    if (!state.diagnosticsLoaded) loadDiagnostics();
+    renderLLM(snapshot.llm || {}, snapshot.jobs?.llm);
+    renderErrors(snapshot);
+    if (!state.reviewDateTouched) {
+      const dates = list(snapshot.calendar?.dates || snapshot.calendar).filter((day) => day < dateAtShanghai() || (day === dateAtShanghai() && seconds >= 54000));
+      if (snapshot.review?.date) $('review-date').value = snapshot.review.date;
+      else if (dates.length) $('review-date').value = dates[dates.length - 1];
+    }
+    tick();
+    loadHistory();
+  }
+
+  function qualityOf(row) {
+    const quality = row.quality || {};
+    const flags = Array.isArray(quality) ? quality : list(quality.flags);
+    const status = quality.status || (flags.length ? 'partial' : 'ok');
+    const labels = {ok: '有效', partial: '部分缺失', not_ready: '未就绪', stale: '数据陈旧', provisional: '待终态核验', invalid: '不可用'};
+    const title = [numeric(quality.factor_coverage) ? `因子覆盖 ${ratio(quality.factor_coverage)}` : '', ...flags].filter(Boolean).join('；');
+    return {status, label: labels[status] || status, title, flags, className: status === 'ok' ? '' : status === 'stale' || status === 'invalid' ? 'bad' : 'warn'};
+  }
+
+  function renderAuction() {
+    const auction = state.snapshot?.auction || {};
+    const allRows = list(auction.rows);
+    const rows = allRows.filter((row) => {
+      if (state.filter === 'consecutive' && Number(row.continue_day_cnt ?? row.consecutive_days ?? 0) < 2) return false;
+      if (state.filter === 'strong' && (!numeric(row.score) || Number(row.score) < 70)) return false;
+      return !state.search || `${row.name || ''} ${row.thscode || ''}`.toLowerCase().includes(state.search);
+    });
+    text('ranking-count', rows.length);
+    text('ranking-limit-note', rows.length > 500 ? '显示前 500 条，可搜索股票查看其他记录' : '点击股票查看因子与观测轨迹');
+    const latest = auction.summary?.last_received_at || allRows.reduce((last, row) => row.updated_at && (!last || row.updated_at > last) ? row.updated_at : last, '');
+    text('ranking-updated', latest ? `采集 ${time(latest)}` : '尚无观测');
+    if (!rows.length) {
+      $('auction-body').innerHTML = `<tr><td colspan="7"><div class="empty-state"><span class="empty-icon">◷</span><strong>${allRows.length ? '没有符合筛选条件的股票' : '等待第一批竞价数据'}</strong><p>${allRows.length ? '尝试其他筛选或清空名称 / 代码。' : '保存密钥 → 准备关注池 → 启动监测<br>非交易时段可运行演示，检查完整分析流程。'}</p>${allRows.length ? '' : '<button class="button small" data-action="demo">运行模拟演示</button>'}</div></td></tr>`;
+    } else {
+      $('auction-body').innerHTML = rows.slice(0, 500).map((row, index) => {
+        const q = qualityOf(row);
+        const rank = numeric(row.score) ? row.rank ?? index + 1 : '—';
+        const days = row.continue_day_cnt ?? row.consecutive_days;
+        return `<tr data-symbol="${esc(row.thscode)}" tabindex="0" aria-label="查看 ${esc(row.name || row.thscode)}" class="${state.selected === row.thscode ? 'selected' : ''}"><td><span class="rank ${rank <= 3 ? 'top' : ''}">${esc(rank)}</span></td><td><span class="stock-name">${esc(row.name || row.thscode)}</span><span class="stock-code">${esc(row.thscode)}</span><span class="source-tags">${sourceTags(row.sources)}</span></td><td class="score-cell"><span class="score-number">${esc(num(row.score, 1))}</span><span class="score-bar"><i style="width:${clamp(row.score)}%"></i></span></td><td class="${tone(row.auction_pct)}">${esc(percent(row.auction_pct))}</td><td>${esc(amount(row.auction_amount))}</td><td>${numeric(days) && Number(days) > 0 ? `<span class="ladder-badge">${esc(num(days, 0))} 板</span>` : '—'}</td><td><span class="quality-pill ${q.className}" title="${esc(q.title)}">${esc(q.label)}</span></td></tr>`;
+      }).join('');
+    }
+    if (state.selected && !allRows.some((row) => row.thscode === state.selected)) {
+      state.selected = null;
+      state.history = [];
+    }
+    renderDetail();
+  }
+
+  function selectStock(symbol) {
+    if (symbol !== state.selected) {
+      state.history = [];
+      state.historyKey = '';
+    }
+    state.selected = symbol;
+    renderAuction();
+    loadHistory(true);
+  }
+
+  async function loadHistory(force = false) {
+    if (!state.selected || state.historyBusy || state.page !== 'auction') return;
+    const snapshot = state.snapshot || {};
+    const key = `${snapshot.mode}:${snapshot.auction?.date || snapshot.auction?.summary?.session_date || ''}:${state.selected}`;
+    if (!force && key === state.historyKey && Date.now() - state.historyLastFetch < 5000) return;
+    state.historyBusy = true;
+    const selected = state.selected;
+    try {
+      const result = await api(`/api/history?symbol=${encodeURIComponent(selected)}`);
+      if (state.selected === selected && state.snapshot?.mode === snapshot.mode) {
+        state.history = list(result);
+        state.historyKey = key;
+        state.historyLastFetch = Date.now();
+        renderDetail();
+      }
+    } catch (error) {
+      state.historyLastFetch = Date.now();
+      state.historyKey = key;
+      if (force) toast(`观测轨迹读取失败：${error.message}`, true);
+    } finally { state.historyBusy = false; }
+  }
+
+  function sparkline(historyItems) {
+    const points = historyItems.filter((item) => numeric(item.auction_pct)).slice(-50);
+    if (points.length < 2) return '<p class="subtle">累计两次有效价格观测后绘制轨迹。</p>';
+    const values = points.map((item) => Number(item.auction_pct));
+    const low = Math.min(...values), high = Math.max(...values), spread = Math.max(high - low, .05);
+    const coords = values.map((value, i) => `${(i / (values.length - 1) * 244 + 3).toFixed(2)},${(59 - (value - low) / spread * 47).toFixed(2)}`);
+    const poly = coords.join(' ');
+    return `<svg class="sparkline" viewBox="0 0 250 72" role="img" aria-label="竞价涨幅观测轨迹，范围 ${esc(num(low, 2))}% 到 ${esc(num(high, 2))}%"><line x1="0" y1="60" x2="250" y2="60" stroke="#2d3c51" stroke-dasharray="3 4"/><polygon points="3,65 ${poly} 247,65" fill="#d8b57410"/><polyline points="${poly}" fill="none" stroke="#d8b574" stroke-width="1.8" stroke-linejoin="round"/><circle cx="247" cy="${coords[coords.length - 1].split(',')[1]}" r="3" fill="#d8b574"/></svg><div class="chart-labels"><span>${esc(time(points[0].received_at || points[0].updated_at))}</span><span>${esc(num(low, 2))} ~ ${esc(num(high, 2))}%</span><span>${esc(time(points[points.length - 1].received_at || points[points.length - 1].updated_at))}</span></div>`;
+  }
+
+  function renderDetail() {
+    const row = list(state.snapshot?.auction?.rows).find((item) => item.thscode === state.selected);
+    if (!row) {
+      $('stock-detail').innerHTML = '<div class="empty-state detail-empty"><span class="empty-icon">⌁</span><strong>选择一只股票</strong><p>查看实时因子贡献、数据质量<br>和已采集的竞价变化。</p></div>';
+      return;
+    }
+    const q = qualityOf(row);
+    const factorEntries = Object.entries(row.factors || {});
+    const factorHTML = factorEntries.map(([key, value]) => {
+      const f = value && typeof value === 'object' ? value : {score: value};
+      const label = f.label || factors[key]?.label || key;
+      const missing = f.available === false || !numeric(f.score);
+      const tooltip = `分数 ${num(f.score, 1)} / 权重 ${ratio(f.weight)} / 贡献 ${num(f.contribution, 1)}${f.value === null || f.value === undefined ? '' : ` / 原值 ${f.value}`}`;
+      return `<div class="factor-row${missing ? ' missing' : ''}" title="${esc(tooltip)}"><span>${esc(label)}</span><div class="factor-track"><i style="width:${clamp(f.score)}%"></i></div><strong>${missing ? '缺失' : esc(num(f.score, 0))}</strong></div>`;
+    }).join('');
+    const items = state.history.length ? state.history : list(row.history);
+    const normalizedItems = items.map((item) => ({...item, auction_pct: item.auction_pct ?? item.price_change_ratio_pct ?? item.change_ratio, auction_amount: item.auction_amount ?? item.amount}));
+    const qualityNotes = [...q.flags];
+    if (numeric(row.quality?.window_coverage)) qualityNotes.push(`十分钟窗口观测覆盖 ${ratio(row.quality.window_coverage)}，首次接收 ${time(row.quality.first_observed_at)}。`);
+    if (row.quality?.upstream_freshness === 'unknown' && !qualityNotes.some((note) => String(note).includes('上游实时延迟未知'))) qualityNotes.push('上游未提供可靠行情时间，页面时间为本地接收时间。');
+    $('stock-detail').innerHTML = `<div class="detail-top"><div><strong class="detail-stock-name">${esc(row.name || row.thscode)}</strong><span class="detail-stock-code">${esc(row.thscode)}</span></div><div class="detail-score">${esc(num(row.score, 1))}<small>竞价综合评分 / 100</small></div></div><div class="detail-facts"><div><span>竞价涨幅</span><strong class="${tone(row.auction_pct)}">${esc(percent(row.auction_pct))}</strong></div><div><span>竞价金额</span><strong>${esc(amount(row.auction_amount))}</strong></div><div><span>有效观测次数</span><strong>${esc(num(row.quality?.observation_count ?? normalizedItems.length, 0))}</strong></div><div><span>因子覆盖</span><strong>${esc(ratio(row.quality?.factor_coverage))}</strong></div></div><div class="detail-section"><h3>因子拆解<span>悬停查看权重贡献</span></h3>${factorHTML || '<p class="subtle">暂无有效因子。</p>'}</div><div class="detail-section"><h3>竞价涨幅轨迹<span>接收顺序</span></h3>${sparkline(normalizedItems)}<div class="history-list">${normalizedItems.slice(-5).reverse().map((item) => `<div class="history-item"><span>${esc(time(item.received_at || item.updated_at))}</span><span class="${tone(item.auction_pct)}">${esc(percent(item.auction_pct))}</span><span>${esc(amount(item.auction_amount))}</span></div>`).join('')}</div></div><div class="detail-section"><h3>数据口径<span class="quality-pill ${q.className}">${esc(q.label)}</span></h3><div class="quality-note">${qualityNotes.length ? qualityNotes.map(esc).join('<br>') : '有效字段已参与计算；评分只反映采集范围内的竞价表现。'}<br>最近接收：${esc(time(row.updated_at))}</div></div>`;
+  }
+
+  function factorBars(entries, labels = {}) {
+    return Object.entries(entries || {}).map(([key, value]) => {
+      const f = value && typeof value === 'object' ? value : {score: value};
+      const missing = f.available === false || !numeric(f.score);
+      const label = f.label || labels[key] || factors[key]?.label || key;
+      const detail = `${f.formula || ''}${f.formula ? '；' : ''}原值 ${numeric(f.value) ? num(f.value, 3) : '—'}；权重 ${ratio(f.weight)}；贡献 ${num(f.contribution, 2)}`;
+      return `<div class="factor-row${missing ? ' missing' : ''}" title="${esc(detail)}"><span>${esc(label)}</span><div class="factor-track"><i style="width:${clamp(f.score)}%"></i></div><strong>${missing ? '缺失' : esc(num(f.score, 0))}</strong></div>`;
+    }).join('');
+  }
+
+  function dailySparkline(historyItems) {
+    const points = list(historyItems).filter((item) => numeric(item.close_price) && Number(item.close_price) > 0).slice(-40);
+    if (points.length < 2) return '<p class="subtle">可用日线不足，尚不能绘制价格轨迹。</p>';
+    const values = points.map((item) => Number(item.close_price));
+    const low = Math.min(...values), high = Math.max(...values), spread = Math.max(high - low, .01);
+    const coords = values.map((value, index) => `${(index / (values.length - 1) * 244 + 3).toFixed(2)},${(62 - (value - low) / spread * 52).toFixed(2)}`);
+    return `<svg class="sparkline" viewBox="0 0 250 72" role="img" aria-label="前复权收盘价轨迹，${esc(num(low, 2))} 到 ${esc(num(high, 2))}"><line x1="0" y1="65" x2="250" y2="65" stroke="#2d3c51" stroke-dasharray="3 4"/><polygon points="3,66 ${coords.join(' ')} 247,66" fill="#d8b57410"/><polyline points="${coords.join(' ')}" fill="none" stroke="#d8b574" stroke-width="1.8" stroke-linejoin="round"/></svg><div class="chart-labels"><span>${esc(points[0].date || '起始日')}</span><span>${esc(num(low, 2))} ~ ${esc(num(high, 2))}</span><span>${esc(points[points.length - 1].date || '末日')}</span></div>`;
+  }
+
+  function renderStocks(stocks, jobs) {
+    const job = jobs.stock || {};
+    const analysis = stocks.analysis;
+    const requested = stocks.query_code || state.queryRequested || analysis?.thscode;
+    let status = '输入股票代码开始查询。没有已采集行情时会明确显示为空。';
+    if (job.status === 'running') status = `${requested || ''} · ${job.message || '正在查询分析，任务在后台继续；完成后自动更新。'}`;
+    else if (job.status === 'error') status = `个股查询失败：${job.message || '请检查代码与行情服务。'}`;
+    else if (analysis?.status === 'deferred') status = `${analysis.thscode || requested || ''} · 当前优先保障竞价采集，历史分析已延后；下方可查看已有本机竞价记录。`;
+    else if (analysis) status = `${analysis.thscode || ''} · ${analysis.status === 'partial' ? '部分数据需核验' : analysis.status === 'unavailable' ? '部分数据不可用' : '查询结果已更新'}${analysis.generated_at ? ` · ${time(analysis.generated_at, true)}` : ''}`;
+    text('stock-job-status', status);
+    $('stock-job-status').classList.toggle('warn', job.status === 'error' || ['partial', 'deferred', 'unavailable'].includes(analysis?.status));
+    $('stock-job-status').classList.toggle('stock-query-progress', job.status === 'running');
+    const hideOld = analysis && job.status === 'running' && requested && !sameCode(requested, analysis.thscode);
+    if (!analysis || hideOld) {
+      text('stock-analysis-date', job.status === 'running' ? '查询进行中' : '尚未查询');
+      $('single-stock-trend').innerHTML = `<div class="empty-state"><span class="empty-icon">⌁</span><strong>${job.status === 'running' ? '正在读取个股数据' : '一只股票，一份独立研究'}</strong><p>${job.status === 'running' ? '较长查询在后台运行，结果会自动显示。' : '输入代码后，查看均线、动量、量能和回撤。<br>日线强弱分与实时竞价评分分别展示。'}</p></div>`;
+      renderSingleAuction(null);
+    } else {
+      renderSingleTrend(analysis);
+      renderSingleAuction(analysis);
+    }
+    const watchlist = Array.isArray(stocks.watchlist) ? stocks.watchlist : (state.snapshot?.config?.watchlist || []).map((code) => ({thscode: code, sources: ['manual'], tracking: false}));
+    text('watchlist-count', watchlist.length);
+    const watchJob = jobs.watchlist || {};
+    text('watchlist-job-status', watchJob.status === 'running' ? watchJob.message || '正在核验并加入股票，请稍候…' : watchJob.status === 'error' ? `加入失败：${watchJob.message}` : '逗号、空格或换行分隔。09:10—09:26 每次仅加入 1 只。');
+    $('watchlist-items').innerHTML = watchlist.length ? watchlist.map((item) => {
+      const row = typeof item === 'string' ? {thscode: item, sources: ['manual']} : item;
+      return `<div class="watchlist-item"><div><button class="watchlist-stock-link" data-query-stock="${esc(row.thscode)}"><span class="stock-name">${esc(row.name || row.thscode)}</span><span class="stock-code">${esc(row.thscode)}</span></button><div class="source-tags">${sourceTags(row.sources?.length ? row.sources : ['manual'])}</div><span class="tracking-label${isCollecting(row.tracking) ? '' : ' pending'}">${esc(trackingLabel(row.tracking))}</span></div><div class="watchlist-item-actions"><button class="watchlist-remove" data-remove-stock="${esc(row.thscode)}" aria-label="移除自选 ${esc(row.name || row.thscode)}" ${watchJob.status === 'running' ? 'disabled' : ''}>移除</button></div></div>`;
+    }).join('') : '<div class="table-empty">还没有自选股。输入代码即可加入关注。</div>';
+    renderTrendPool(stocks.trend_pool, jobs.trends);
+    document.querySelectorAll('[data-job]').forEach((button) => { button.disabled = jobs[button.dataset.job]?.status === 'running'; });
+  }
+
+  function renderSingleTrend(analysis) {
+    const trend = analysis.trend || {};
+    const sourceLabel = typeof analysis.source === 'string' ? analysis.source : typeof analysis.source?.provider === 'string' ? analysis.source.provider : '行情数据源';
+    const methodDescription = typeof analysis.score_method === 'string' ? analysis.score_method : typeof analysis.score_method?.description === 'string' ? analysis.score_method.description : '固定研究权重；悬停查看各项原值、权重和贡献。';
+    const warningList = [...new Set([...list(analysis.warnings), ...list(trend.warnings)])];
+    const deferred = analysis.status === 'deferred';
+    text('stock-analysis-date', analysis.date ? `截止 ${analysis.date}` : deferred ? '历史分析已延后' : '日期未提供');
+    const positions = [[5, trend.above_ma5], [10, trend.above_ma10], [20, trend.above_ma20]].filter(([, value]) => value !== null && value !== undefined).map(([days, value]) => `${value ? '上' : '下'} MA${days}`);
+    const factorHTML = factorBars(analysis.trend_factors || trend.score_factors, {momentum_5d: '五日动量', ma_position: '均线位置', drawdown_control: '回撤控制', volume_confirmation: '量能确认'});
+    $('single-stock-trend').innerHTML = `<div class="stock-trend-summary"><div><h3>${esc(analysis.name || analysis.thscode)}</h3><span class="stock-code">${esc(analysis.thscode)}</span><div class="stock-analysis-info">${esc(sourceLabel)}${trend.as_of ? ` · K 线截至 ${esc(trend.as_of)}` : ''}${analysis.generated_at ? ` · 生成 ${esc(time(analysis.generated_at))}` : ''}</div></div><div class="detail-score">${esc(num(analysis.trend_score, 1))}<small>日线强弱分 / 100</small></div></div>${deferred ? '<div class="stock-warning-list">竞价保护时段内，日线请求已延后。此处空值表示尚未完成采集，不表示趋势为零。</div>' : ''}<div class="stock-mini-metrics"><div class="stock-mini-metric"><span>前复权收盘价</span><strong>${esc(num(trend.close, 2))}</strong><small>不等同未复权报价</small></div><div class="stock-mini-metric"><span>近 5 日涨幅</span><strong class="${tone(trend.return_5d_pct)}">${esc(percent(trend.return_5d_pct))}</strong><small>${esc(num(trend.bar_count, 0))} 根有效日线</small></div><div class="stock-mini-metric"><span>相对 5 日量能</span><strong>${esc(num(trend.volume_ratio_5d, 2))}${numeric(trend.volume_ratio_5d) ? ' 倍' : ''}</strong><small>结合价格方向观察</small></div><div class="stock-mini-metric"><span>20 日最大回撤</span><strong>${numeric(trend.max_drawdown_20d_pct) ? `${esc(num(trend.max_drawdown_20d_pct, 2))}%` : '—'}</strong><small>仅历史窗口表现</small></div></div><div class="single-trend-body"><div class="single-trend-chart"><h3>前复权收盘轨迹</h3>${dailySparkline(analysis.history)}<p class="stock-analysis-info">MA5 ${esc(num(trend.ma5, 2))} · MA10 ${esc(num(trend.ma10, 2))} · MA20 ${esc(num(trend.ma20, 2))}<br>${esc(positions.join(' / ') || '均线历史不足')}</p></div><div class="single-trend-factors"><h3>日线强弱因子 <span class="subtle">覆盖 ${esc(ratio(analysis.trend_coverage))}</span></h3>${factorHTML || '<p class="subtle">暂无可计算的趋势因子。</p>'}<p class="field-help">${esc(methodDescription)}</p></div></div>${warningList.length ? `<div class="stock-warning-list">${warningList.map(esc).join('<br>')}</div>` : ''}`;
+  }
+
+  function renderSingleAuction(analysis) {
+    const auction = analysis?.auction;
+    const row = auction?.row;
+    const demo = auction?.mode === 'demo';
+    text('single-auction-mode', auction ? demo ? 'DEMO · 模拟观测' : 'LIVE · 本机记录' : '尚无记录');
+    $('single-auction-mode').className = `pill ${demo ? 'amber' : ''}`;
+    text('single-auction-context', auction ? `${auction.date || '日期未标注'} · ${trackingLabel(auction.tracking)} · 排名范围 ${num(auction.scope_count, 0)} 只` : '仅显示实际采集记录；加入关注不会补齐过去十分钟。');
+    if (!row) {
+      $('single-stock-auction').innerHTML = `<div class="empty-state"><span class="empty-icon">◷</span><strong>${analysis ? '这只股票尚无本机竞价记录' : '尚无个股竞价记录'}</strong><p>${analysis ? '可加入关注，在交易日竞价窗口持续采集。<br>未采集的数据不会用收盘行情或零值替代。' : '查询股票后会显示本机观测、七项因子与排名范围。'}</p></div>`;
+      return;
+    }
+    const q = qualityOf(row);
+    const items = list(auction.history);
+    const flags = [...q.flags];
+    if (!auction.tracking) flags.unshift('当前展示已留存的观测，本机未持续监测这只股票。');
+    if (demo) flags.unshift('以下为明确标记的模拟数据，不是实盘行情。');
+    $('single-stock-auction').innerHTML = `<div class="single-auction-summary"><div><strong>${esc(num(row.score, 1))}<small> 分</small></strong><div class="stock-analysis-info">本池排名 ${numeric(row.rank) ? `第 ${esc(num(row.rank, 0))}` : '未参与有效排名'} / ${esc(num(auction.scope_count, 0))} 只</div></div><div class="subtle"><span class="quality-pill ${q.className}">${esc(q.label)}</span><br>最近接收 ${esc(time(row.updated_at))}<div class="source-tags">${sourceTags(row.sources)}</div></div></div><div class="stock-mini-metrics"><div class="stock-mini-metric"><span>竞价涨幅</span><strong class="${tone(row.auction_pct)}">${esc(percent(row.auction_pct))}</strong></div><div class="stock-mini-metric"><span>竞价金额</span><strong>${esc(amount(row.auction_amount))}</strong></div><div class="stock-mini-metric"><span>已采集观测</span><strong>${esc(num(row.quality?.observation_count ?? items.length, 0))}<small>窗口覆盖 ${esc(ratio(row.quality?.window_coverage))}</small></strong></div><div class="stock-mini-metric"><span>因子覆盖</span><strong>${esc(ratio(row.quality?.factor_coverage))}</strong></div></div><div class="single-auction-detail"><div><h3>七项竞价因子</h3>${factorBars(row.factors) || '<p class="subtle">暂无有效因子。</p>'}</div><div><h3>竞价涨幅轨迹 <span class="subtle">按本地接收顺序</span></h3>${sparkline(items)}<div class="history-list">${items.slice(-6).reverse().map((item) => `<div class="history-item"><span>${esc(time(item.received_at))}</span><span class="${tone(item.auction_pct)}">${esc(percent(item.auction_pct))}</span><span>${esc(amount(item.auction_amount))}</span></div>`).join('')}</div></div></div>${flags.length ? `<div class="stock-warning-list">${flags.map(esc).join('<br>')}</div>` : ''}`;
+  }
+
+  function renderTrendPool(pool, job) {
+    const rows = list(pool);
+    text('trend-pool-count', rows.length);
+    text('trend-pool-description', pool?.date ? `截止 ${pool.date} · 候选 ${num(pool.candidate_count, 0)} · 已分析 ${num(pool.evaluated_count, 0)} · 有效历史 ${num(pool.valid_history_count, 0)} · 入选 ${num(pool.selected_count ?? rows.length, 0)}` : '自选＋昨日涨停＋趋势强股，构成重点关注池。');
+    const notes = list(pool?.warnings);
+    const status = job?.status === 'running' ? job.message || '正在刷新趋势池，请稍候…' : job?.status === 'error' ? `刷新失败：${job.message}` : pool ? `${pool.status === 'partial' ? '部分候选数据不完整。' : '趋势池已更新。'}${pool.generated_at ? `生成于 ${time(pool.generated_at, true)}。` : ''}${pool.method || ''}` : '尚未建立趋势池。09:10—09:26 暂停手动刷新，以优先保障竞价采集。';
+    text('trend-pool-status', `${status} 筛选分只用于入池排序，与日线强弱分、竞价评分分别计算。${notes.length ? ` ${notes.join('；')}` : ''}`);
+    $('trend-pool-status').classList.toggle('warn', job?.status === 'error' || pool?.status === 'partial' || notes.length > 0);
+    $('trend-pool-body').innerHTML = rows.length ? rows.map((row) => {
+      const trend = row.trend || {};
+      return `<tr><td><button class="watchlist-stock-link" data-query-stock="${esc(row.thscode)}"><span class="stock-name">${esc(row.name || row.thscode)}</span><span class="stock-code">${esc(row.thscode)}</span></button></td><td><span class="score-number">${esc(num(row.trend_score ?? row.score, 1))}</span></td><td>${esc(num(trend.close, 2))}</td><td class="${tone(trend.return_5d_pct)}">${esc(percent(trend.return_5d_pct))}</td><td>${esc(num(trend.ma5, 2))} / ${esc(num(trend.ma20, 2))}</td><td class="trend-reason">${esc(Array.isArray(row.reason) ? row.reason.join('；') : row.reason || '满足趋势池研究条件')}</td><td><div class="trend-pool-actions"><button class="button" data-query-stock="${esc(row.thscode)}">查询</button><button class="button" data-add-stock="${esc(row.thscode)}" data-job="watchlist">＋ 关注</button></div></td></tr>`;
+    }).join('') : '<tr><td colspan="7" class="table-empty">尚无入选股票。未取得历史数据不等于趋势评分为零。</td></tr>';
+  }
+
+  async function queryStock(code, trigger) {
+    if (state.snapshot?.jobs?.stock?.status === 'running') { toast('已有个股查询正在后台运行，完成后可继续查询。'); return; }
+    let codes;
+    try { codes = parseStockCodes(code); } catch (error) { toast(error.message, true); return; }
+    if (codes.length !== 1) { toast('单股查询每次请输入一个股票代码。', true); return; }
+    state.queryRequested = codes[0];
+    $('stock-code').value = codes[0];
+    showPage('stocks');
+    text('stock-job-status', `${codes[0]} · 正在提交查询；较长分析在后台运行，完成后自动更新。`);
+    await mutate('/api/stocks/analyze', {code: codes[0], ...($('stock-query-date').value ? {date: $('stock-query-date').value} : {})}, '个股查询已提交', trigger);
+  }
+
+  async function addWatchlist(value, trigger) {
+    let codes;
+    try { codes = parseStockCodes(value); } catch (error) { toast(error.message, true); return; }
+    text('watchlist-job-status', `正在提交 ${codes.length} 只股票进行核验…`);
+    await mutate('/api/watchlist/add', {codes}, '自选加入任务已提交', trigger);
+  }
+
+  function displayedReportKey() {
+    const report = state.snapshot?.review;
+    return report ? `${state.snapshot.mode}|${state.snapshot.review_id || `${report.date}|${report.generated_at}|${report.status}`}` : `${state.snapshot?.mode}|empty`;
+  }
+
+  function matchingReviewAI() {
+    const result = state.snapshot?.llm?.result;
+    return Boolean(result && result.scope === 'review' && result.mode === state.snapshot?.mode && result.review_id && result.review_id === state.snapshot?.review_id && result.review_date === state.snapshot?.review?.date);
+  }
+
+  function renderReportControls() {
+    const report = state.snapshot?.review;
+    const demo = state.snapshot?.mode === 'demo' || report?.mode === 'demo' || report?.source === 'demo';
+    const available = Boolean(report?.date);
+    text('report-display-date', report?.date || '尚未生成');
+    text('report-display-mode', available ? `${demo ? '模拟报告' : '真实数据复盘'} · 保存与导出均使用此日期` : '保存与导出均使用此报告日期');
+    text('comparison-current', report?.date || '—');
+    $('report-save').disabled = !available || state.reportSaveBusy;
+    $('report-save').textContent = state.reportSaveBusy ? '正在保存…' : '保存 Markdown ↓';
+    const aiAvailable = available && matchingReviewAI();
+    $('report-include-ai').disabled = !aiAvailable || state.reportSaveBusy;
+    if (!aiAvailable) $('report-include-ai').checked = false;
+    $('report-include-ai').parentElement.title = aiAvailable ? '仅附上与当前这份报告匹配的 AI 研判，不额外调用模型。' : '请先在下方使用当前报告生成 AI 研判；其他日期或版本的分析不会附入。';
+    const jsonLink = $('report-json');
+    jsonLink.classList.toggle('disabled-link', !available);
+    jsonLink.setAttribute('aria-disabled', String(!available));
+    if (available) {
+      const query = new URLSearchParams({date: report.date, format: 'json'});
+      if (state.snapshot.review_id) query.set('review_id', state.snapshot.review_id);
+      jsonLink.href = `/api/report?${query}`;
+      jsonLink.download = `${demo ? 'demo-' : ''}market-review-${report.date}.json`;
+    } else jsonLink.removeAttribute('href');
+    $('report-history-date').disabled = demo || state.reportsBusy || state.reportLoadBusy;
+    $('report-history-refresh').disabled = demo || state.reportsBusy;
+    $('report-load').disabled = demo || !state.reports.length || !$('report-history-date').value || state.reportLoadBusy || state.snapshot?.jobs?.review?.status === 'running';
+    $('report-load').textContent = state.reportLoadBusy ? '正在读取…' : '读取历史';
+    $('comparison-baseline').disabled = demo || state.reportsBusy || state.comparisonBusy;
+    $('comparison-run').disabled = demo || !available || !$('comparison-baseline').value || state.comparisonBusy || state.reportsBusy;
+    $('comparison-run').textContent = state.comparisonBusy ? '计算中…' : '开始对比';
+  }
+
+  function renderReportOptions() {
+    const current = state.snapshot?.review?.date;
+    const reportDates = [...new Set(state.reports.map((item) => item.date).filter((date) => /^\d{4}-\d{2}-\d{2}$/.test(date)))].sort().reverse();
+    for (const id of ['report-history-date', 'comparison-baseline']) {
+      const select = $(id);
+      const previousValue = select.value;
+      const dates = id === 'comparison-baseline' ? reportDates.filter((date) => current && date < current) : reportDates;
+      const placeholder = document.createElement('option');
+      placeholder.value = '';
+      placeholder.textContent = dates.length ? '选择已保存日期' : id === 'comparison-baseline' ? '暂无更早日期报告' : '暂无本机历史报告';
+      select.replaceChildren(placeholder, ...dates.map((date) => {
+        const item = state.reports.find((entry) => entry.date === date);
+        const option = document.createElement('option');
+        option.value = date;
+        option.textContent = `${date}${item?.status === 'partial' ? ' · 部分数据' : ''}`;
+        return option;
+      }));
+      select.value = dates.includes(previousValue) ? previousValue : id === 'report-history-date' && dates.includes(current) ? current : dates.find((date) => date < current) || dates[0] || '';
+    }
+    renderReportControls();
+  }
+
+  async function loadReports() {
+    const mode = state.snapshot?.mode;
+    if (!mode || state.reportsBusy) return;
+    state.reportsMode = mode;
+    const generation = ++state.reportsGeneration;
+    if (mode === 'demo') {
+      state.reports = [];
+      renderReportOptions();
+      text('report-history-status', '演示期间不读取真实历史报告；切换实盘后可查看。');
+      return;
+    }
+    state.reportsBusy = true;
+    renderReportControls();
+    text('report-history-status', '正在读取本机报告目录…');
+    try {
+      const result = await api('/api/reports');
+      if (generation !== state.reportsGeneration || state.snapshot?.mode !== mode) return;
+      state.reports = list(result.items).filter((item) => item.mode !== 'demo');
+      renderReportOptions();
+      text('report-history-status', state.reports.length ? `共 ${state.reports.length} 份真实报告 · 本机读取无需联网` : '还没有本机历史报告；联网生成后自动留存。');
+    } catch (error) {
+      if (state.snapshot?.mode === mode) { text('report-history-status', `列表读取失败：${error.message}`); toast(error.message, true); }
+    } finally {
+      state.reportsBusy = false;
+      renderReportControls();
+      if (state.snapshot?.mode !== mode || state.reportsRefreshPending) {
+        state.reportsRefreshPending = false;
+        loadReports();
+      }
+    }
+  }
+
+  async function loadSavedReport() {
+    const date = $('report-history-date').value;
+    if (!date || state.reportLoadBusy || state.snapshot?.mode === 'demo') return;
+    state.reportLoadBusy = true;
+    renderReportControls();
+    text('report-history-status', `正在读取 ${date} 的本机报告…`);
+    try {
+      const result = await api('/api/reports/load', {date});
+      await fetchState();
+      text('report-history-status', result.message || `已读取 ${date}，未请求行情服务。`);
+      toast(`已读取 ${date} 的本机复盘`);
+    } catch (error) { text('report-history-status', `读取失败：${error.message}`); toast(error.message, true); }
+    finally { state.reportLoadBusy = false; renderReportControls(); }
+  }
+
+  async function saveMarkdown() {
+    const report = state.snapshot?.review;
+    if (!report?.date || state.reportSaveBusy) return;
+    const body = {date: report.date, include_ai: $('report-include-ai').checked && matchingReviewAI(), provider: state.snapshot?.llm?.active_provider};
+    if (state.snapshot.review_id) body.review_id = state.snapshot.review_id;
+    if ($('report-include-comparison').checked && state.comparisonBaseline) body.baseline = state.comparisonBaseline;
+    state.reportSaveBusy = true;
+    renderReportControls();
+    text('report-save-status', `正在保存 ${report.date} 的 Markdown 文档…`);
+    try {
+      const result = await api('/api/reports/save', body);
+      text('report-save-status', `${report.date} 已保存：${result.path || result.filename || '本机报告目录'}。`);
+      if (result.download_url) {
+        const url = new URL(result.download_url, location.origin);
+        if (url.origin === location.origin && url.pathname === '/api/reports/download') {
+          const link = document.createElement('a');
+          link.href = url.href;
+          link.download = result.filename || `market-review-${report.date}.md`;
+          link.textContent = '再次下载 Markdown';
+          link.className = 'text-button report-download';
+          $('report-save-status').append(' 已尝试启动浏览器下载；', link);
+          link.click();
+        }
+      }
+      toast(`${report.date} Markdown 已保存${body.include_ai ? '，含对应 AI 研判' : ''}`);
+      loadReports();
+    } catch (error) { text('report-save-status', `保存失败：${error.message}`); toast(error.message, true); }
+    finally { state.reportSaveBusy = false; renderReportControls(); }
+  }
+
+  function resetComparison() {
+    ++state.comparisonGeneration;
+    state.comparisonBusy = false;
+    state.comparisonBaseline = '';
+    $('report-include-comparison').checked = false;
+    $('report-include-comparison').disabled = true;
+    $('comparison-result').replaceChildren();
+    const demo = state.snapshot?.mode === 'demo';
+    text('comparison-status', demo ? '演示模式不对比真实历史报告。' : '选择另一份已保存报告，比较两期涨停名单、市场指标与共同板块；不会联网补齐缺失数据。');
+    $('comparison-status').classList.remove('warn');
+  }
+
+  function compareValue(value, unit, delta = false) {
+    if (!numeric(value)) return '—';
+    const prefix = delta && Number(value) > 0 ? '+' : '';
+    if (['元', 'yuan', 'CNY', 'amount'].includes(unit)) return `${prefix}${amount(value)}`;
+    if (['%', 'pct', 'percent', '百分点', 'pp'].includes(unit)) return `${prefix}${num(value, 2)}${delta ? ' 个百分点' : '%'}`;
+    return `${prefix}${num(value, Number.isInteger(Number(value)) ? 0 : 2)}${['家', '只', '板'].includes(unit) ? unit : ''}`;
+  }
+
+  function renderComparison(result) {
+    const warnings = [...list(result.warnings), ...list(result.sectors?.warnings)];
+    text('comparison-status', `${result.current_date || '当前'} 对比 ${result.previous_date || '基准'} · ${result.adjacent_sessions === true ? '相邻交易日' : result.adjacent_sessions === false ? '非相邻交易日；两期交集不等于连续涨停' : '未确认是否相邻交易日'}${warnings.length ? ` · ${warnings.join('；')}` : ''}`);
+    $('comparison-status').classList.toggle('warn', result.status !== 'ready' || warnings.length > 0);
+    const marketRows = list(result.market?.rows);
+    const changes = result.limit_up || {};
+    const stockGroups = [['retained', '共同两期涨停', changes.retained_count], ['new', '当期新出现', changes.new_count], ['exited', '从对比池退出', changes.exited_count]];
+    const marketHtml = `<div class="table-scroll"><table class="data-table comparison-market"><thead><tr><th>盘面指标</th><th>当期</th><th>对比期</th><th>变化</th><th>数据质量</th></tr></thead><tbody>${marketRows.length ? marketRows.map((row) => `<tr><td>${esc(row.label || row.id)}</td><td>${esc(compareValue(row.current, row.unit))}</td><td>${esc(compareValue(row.previous, row.unit))}</td><td class="${tone(row.delta)}">${esc(compareValue(row.delta, row.unit, true))}</td><td>${esc({ok: '可比', ready: '可比', provisional: '日期待核验', missing: '缺少数据', unavailable: '不可比'}[row.status] || row.status || '—')}</td></tr>`).join('') : '<tr><td colspan="5" class="table-empty">没有可比较的市场指标。</td></tr>'}</tbody></table></div>`;
+    const stocksHtml = `<div class="comparison-stock-groups">${stockGroups.map(([key, label, count]) => {
+      const rows = list(changes[key]);
+      const countText = numeric(count) ? num(count, 0) : '—';
+      return `<section><h3>${label}<span>${esc(countText)}</span></h3><p>${key === 'retained' ? '仅说明两期都在涨停池中' : key === 'new' ? '不等同于首次涨停' : '不等同于断板或下跌'}</p><div class="comparison-stock-list">${rows.length ? rows.slice(0, 30).map((row) => `<button class="comparison-stock" data-query-stock="${esc(row.thscode)}"><span><strong>${esc(row.name || row.thscode)}</strong><small>${esc(row.thscode)}</small></span><span>${numeric(row.current?.score) ? `${esc(num(row.current.score, 1))} 分` : numeric(row.previous?.score) ? `前期 ${esc(num(row.previous.score, 1))}` : '—'}<small>${row.current?.consecutive_lower_bound ? '≥ ' : ''}${numeric(row.current?.consecutive_days) ? `${esc(num(row.current.consecutive_days, 0))} 板` : '当前板数未知'}</small></span></button>`).join('') : `<span class="comparison-empty">${changes.status === 'unavailable' ? '数据不足，无法确认名单' : '该分类没有股票'}</span>`}</div>${rows.length > 30 ? `<p>显示前 30 / ${esc(rows.length)} 只</p>` : ''}</section>`;
+    }).join('')}</div>`;
+    const sectors = result.sectors || {};
+    const coverage = sectors.coverage || {};
+    const sectorRows = list(sectors.rows);
+    const sectorHtml = `<div class="comparison-sector-title"><h3>共同板块的强弱变化</h3><p>当期样本 ${esc(num(coverage.current_count, 0))} · 对比期 ${esc(num(coverage.previous_count, 0))} · 共同 ${esc(num(coverage.common_count, 0))} · 可比 ${esc(num(coverage.comparable_count, 0))}。名次为各期样本相对排名；成交额变化不代表资金净流入。</p></div><div class="table-scroll"><table class="data-table"><thead><tr><th>板块</th><th>当期 / 前期名次</th><th>名次前进</th><th>当期涨幅</th><th>前期涨幅</th><th>涨幅变化</th><th>成交额变化</th><th>数据质量</th></tr></thead><tbody>${sectorRows.length ? sectorRows.slice(0, 30).map((row) => `<tr><td><span class="stock-name">${esc(row.name || row.thscode)}</span><span class="stock-code">${esc(row.thscode)}</span></td><td>${esc(num(row.current_rank, 0))} / ${esc(num(row.previous_rank, 0))}</td><td class="${tone(row.rank_change)}">${esc(compareValue(row.rank_change, '', true))}</td><td class="${tone(row.current_change_pct)}">${esc(percent(row.current_change_pct))}</td><td class="${tone(row.previous_change_pct)}">${esc(percent(row.previous_change_pct))}</td><td class="${tone(row.change_delta_pp)}">${esc(compareValue(row.change_delta_pp, 'pp', true))}</td><td class="${tone(row.turnover_change_pct)}">${esc(percent(row.turnover_change_pct))}</td><td>${esc({ok: '可比', ready: '可比', provisional: '日期待核验', missing: '缺少数据', unavailable: '不可比'}[row.status] || row.status || '—')}</td></tr>`).join('') : '<tr><td colspan="8" class="table-empty">没有可比的共同板块，缺失数据保持为空。</td></tr>'}</tbody></table></div>`;
+    $('comparison-result').innerHTML = marketHtml + stocksHtml + sectorHtml;
+  }
+
+  async function compareReports() {
+    const date = state.snapshot?.review?.date;
+    const baseline = $('comparison-baseline').value;
+    if (!date || !baseline || state.comparisonBusy || state.snapshot?.mode === 'demo') return;
+    const key = displayedReportKey();
+    const generation = ++state.comparisonGeneration;
+    state.comparisonBusy = true;
+    state.comparisonBaseline = '';
+    $('report-include-comparison').checked = false;
+    $('report-include-comparison').disabled = true;
+    renderReportControls();
+    text('comparison-status', `正在对比 ${date} 与 ${baseline} 的本机报告…`);
+    $('comparison-result').replaceChildren();
+    try {
+      const result = await api(`/api/reports/compare?${new URLSearchParams({date, baseline})}`);
+      if (generation === state.comparisonGeneration && key === displayedReportKey()) {
+        renderComparison(result);
+        state.comparisonBaseline = result.status !== 'unavailable' ? baseline : '';
+        $('report-include-comparison').disabled = !state.comparisonBaseline;
+      }
+    } catch (error) {
+      if (generation === state.comparisonGeneration) { text('comparison-status', `对比失败：${error.message}`); $('comparison-status').classList.add('warn'); }
+    } finally {
+      if (generation === state.comparisonGeneration) state.comparisonBusy = false;
+      renderReportControls();
+    }
+  }
+
+  async function loadDiagnostics() {
+    if (state.diagnosticsBusy) return;
+    state.diagnosticsBusy = true;
+    state.diagnosticsLoaded = true;
+    $('diagnostics-refresh').disabled = true;
+    text('diagnostics-summary', '正在检查本机状态…');
+    try {
+      const result = await api('/api/diagnostics');
+      const names = {ok: '就绪', warn: '待处理', error: '需处理', info: '提示'};
+      text('diagnostics-summary', result.summary || '检查已完成');
+      text('diagnostics-badge', names[result.status] || '已检查');
+      $('diagnostics-badge').className = `pill ${result.status === 'ok' ? 'green' : ['warn', 'error'].includes(result.status) ? 'amber' : ''}`;
+      text('diagnostics-time', `${result.checked_at ? `检查于 ${time(result.checked_at, true)} · ` : ''}仅检查本机状态，不验证交易所时延或外部接口认证。`);
+      $('diagnostics-checks').innerHTML = list(result.checks).map((check) => `<div class="diagnostic-check"><span class="diagnostic-status ${['ok', 'warn', 'error', 'info'].includes(check.status) ? check.status : 'info'}">${esc(names[check.status] || '提示')}</span><div><strong>${esc(check.label || check.id)}</strong><p>${esc(check.message || '—')}</p></div></div>`).join('');
+    } catch (error) { text('diagnostics-summary', `本机检查失败：${error.message}`); text('diagnostics-badge', '检查失败'); }
+    finally { state.diagnosticsBusy = false; $('diagnostics-refresh').disabled = false; }
+  }
+
+  function renderReview(report, job) {
+    const signature = displayedReportKey();
+    const changed = state.reportSignature !== signature;
+    if (changed) {
+      state.reportSignature = signature;
+      resetComparison();
+      renderReportOptions();
+      if (!state.reportSaveBusy) text('report-save-status', 'Markdown 保存到本机报告目录，并提供浏览器下载；不会重新请求行情。');
+      if (state.reportsMode === state.snapshot?.mode) loadReports();
+    }
+    if (!report) {
+      text('review-status', job?.status === 'running' ? job.message || '正在生成复盘，请稍候…' : job?.status === 'error' ? `复盘失败：${job.message}` : '尚未生成复盘。请选择已收盘的交易日期。');
+      $('review-status').classList.toggle('warn', job?.status === 'error');
+      if (!changed) return;
+      ['review-limit-count', 'review-ladder-value', 'review-seal-rate', 'review-breadth'].forEach((id) => text(id, '—'));
+      text('review-limit-note', '实际涨停池');
+      text('review-breadth-note', '市场宽度');
+      $('review-breadth-note').classList.remove('date-unverified');
+      $('review-breadth-note').removeAttribute('title');
+      $('review-stocks-body').innerHTML = '<tr><td colspan="7" class="table-empty">生成复盘后显示涨停股分析。</td></tr>';
+      $('sectors-body').innerHTML = '<tr><td colspan="7" class="table-empty">暂无板块数据。</td></tr>';
+      $('price-trend-body').innerHTML = '<tr><td colspan="9" class="table-empty">生成复盘后显示样本股日线趋势。</td></tr>';
+      $('review-trend').innerHTML = '<p class="subtle">暂无梯队数据。</p>';
+      $('review-status').classList.toggle('warn', job?.status === 'error');
+      return;
+    }
+    const market = report.market || {};
+    const limit = report.limit_up || {};
+    const stocks = list(limit);
+    const warnings = list(report.warnings);
+    const partial = report.status === 'partial' || warnings.length > 0;
+    const demo = report.mode === 'demo' || report.source === 'demo' || state.snapshot?.mode === 'demo';
+    text('review-status', `${demo ? '【模拟复盘】 ' : ''}${report.date || '未标注日期'} · ${job?.status === 'running' ? job.message || '正在更新' : job?.status === 'error' ? `上次更新失败：${job.message}` : report.status === 'partial' ? '部分数据需核验' : '复盘已生成'}${report.generated_at ? ` · 生成于 ${time(report.generated_at, true)}` : ''}${warnings.length ? ` · ${warnings.join('；')}` : ''}`);
+    $('review-status').classList.toggle('warn', partial || demo);
+    if (!changed) return;
+    text('review-limit-count', num(market.limit_up_count ?? limit.count, 0));
+    text('review-limit-note', `炸板 ${num(market.limit_break_count, 0)} · 跌停 ${num(market.limit_down_count, 0)}`);
+    $('review-ladder-value').innerHTML = `${esc(num(limit.consecutive_count, 0))}<small> / ${esc(num(limit.max_consecutive, 0))} 板</small>`;
+    text('review-seal-rate', numeric(market.seal_rate_pct) ? `${num(market.seal_rate_pct, 1)}%` : '—');
+    $('review-breadth').innerHTML = `<span class="positive">${esc(num(market.advancing, 0))}</span><small> / </small><span class="negative">${esc(num(market.declining, 0))}</span>`;
+    const inferredDate = market.date_basis === 'inferred_latest_closed_session';
+    const breadthNote = `${inferredDate ? '休市快照推断，交易日未直接核验 · ' : ''}成交额 ${amount(market.total_turnover)}${market.snapshot_date ? ` · 快照 ${market.snapshot_date}` : ''}${inferredDate && market.effective_trade_date ? ` · 推断交易日 ${market.effective_trade_date}` : ''}`;
+    text('review-breadth-note', breadthNote);
+    $('review-breadth-note').title = breadthNote;
+    $('review-breadth-note').classList.toggle('date-unverified', inferredDate);
+    $('review-stocks-body').innerHTML = stocks.length ? stocks.slice(0, 250).map((row, index) => {
+      const quality = Array.isArray(row.quality) ? row.quality.join('；') : '';
+      const lowerBound = row.consecutive_lower_bound ? '≥ ' : '';
+      return `<tr title="${esc(quality)}"><td><span class="rank ${index < 3 ? 'top' : ''}">${esc(row.rank ?? index + 1)}</span></td><td><span class="stock-name">${esc(row.name || row.stock_name || row.thscode)}</span><span class="stock-code">${esc(row.thscode || row.code)}</span></td><td><span class="score-number">${esc(num(row.score, 1))}</span><span class="sector-source">覆盖 ${esc(num(row.factor_coverage_pct, 0))}%</span></td><td><span class="ladder-badge">${lowerBound}${esc(num(row.consecutive_days ?? row.continue_day_cnt, 0))} 板</span></td><td>${esc(row.limit_up_time || '—')}</td><td>${esc(amount(row.seal_money))}</td><td>${esc(num(row.trend?.last_5_appearances, 0))} / ${esc(num(row.trend?.last_5_observed_days, 0))} 日</td></tr>`;
+    }).join('') : '<tr><td colspan="7" class="table-empty">暂无可显示的涨停池；请查看上方数据完整性提示。</td></tr>';
+    renderTrend(report);
+    renderPriceTrends(report);
+    const sectorData = report.sectors || {};
+    const sectors = list(sectorData);
+    const sectorDateNote = sectorData.date_basis === 'inferred_latest_closed_session' ? ` 休市快照推断，交易日未直接核验；快照 ${list(sectorData.snapshot_dates).join('、') || '未标注'}，暂定归属 ${sectorData.effective_trade_date || report.date || '未知'}。` : '';
+    text('sector-method', `${sectorData.method || '以成交活跃度、涨幅和涨停参与度估计板块强弱；不等同于主力净流入。'}${sectorDateNote}`);
+    $('sectors-body').innerHTML = sectors.length ? sectors.slice(0, 150).map((sector) => {
+      const netAvailable = numeric(sector.net_flow) && !['unavailable', 'missing'].includes(sector.net_flow_status);
+      const category = {industry: '行业', cn_concept: '概念', concept: '概念', ths: '概念', sw: '行业'}[sector.category] || sector.category || '—';
+      return `<tr><td><span class="stock-name">${esc(sector.name || sector.thscode)}</span><span class="stock-code">${esc(sector.thscode)}</span></td><td>${esc(category)}</td><td class="${tone(sector.price_change_ratio_pct)}">${esc(percent(sector.price_change_ratio_pct))}</td><td>${esc(amount(sector.turnover))}</td><td>${netAvailable ? `<span class="${tone(sector.net_flow)}">${esc(amount(sector.net_flow))}</span>` : '<span class="subtle">未提供</span>'}</td><td>${esc(num(sector.limit_up_count, 0))}<span class="sector-source">连板 ${esc(num(sector.consecutive_count, 0))}</span></td><td><span class="score-number">${esc(num(sector.score, 1))}</span><span class="sector-source">${netAvailable ? '含真实净流入字段' : '量价活跃度代理指标'}</span></td></tr>`;
+    }).join('') : '<tr><td colspan="7" class="table-empty">暂无可用的板块数据；数据获取失败不会计为零。</td></tr>';
+  }
+
+  function renderPriceTrends(report) {
+    const rows = list(report.trend?.price_leaders);
+    const coverage = report.trend?.price_coverage || {};
+    text('price-trend-coverage', `涨停强度前 ${num(coverage.limit ?? 20, 0)} 只 · 有效 ${num(coverage.available, 0)} / 请求 ${num(coverage.requested, 0)} · 前复权日线（价格不等同当日未复权报价）`);
+    $('price-trend-body').innerHTML = rows.length ? rows.map((row) => {
+      const positions = [[5, row.above_ma5], [10, row.above_ma10], [20, row.above_ma20]].filter(([, value]) => value !== null && value !== undefined).map(([days, value]) => `${value ? '上' : '下'} MA${days}`);
+      const warnings = list(row.warnings).join('；');
+      return `<tr title="${esc(warnings)}"><td><span class="stock-name">${esc(row.name || row.thscode)}</span><span class="stock-code">${esc(row.thscode)}</span></td><td>${esc(num(row.close, 2))}</td><td>${esc(num(row.ma5, 2))}</td><td>${esc(num(row.ma10, 2))}</td><td>${esc(num(row.ma20, 2))}</td><td class="${tone(row.return_5d_pct)}">${esc(percent(row.return_5d_pct))}</td><td>${esc(num(row.volume_ratio_5d, 2))} 倍</td><td>${numeric(row.max_drawdown_20d_pct) ? `${esc(num(row.max_drawdown_20d_pct, 2))}%` : '—'}</td><td><span class="subtle">${esc(positions.join(' / ') || '历史不足')}</span></td></tr>`;
+    }).join('') : '<tr><td colspan="9" class="table-empty">暂无可用日线趋势。历史不足或获取失败的指标保持空值。</td></tr>';
+  }
+
+  function renderTrend(report) {
+    const limit = report.limit_up || {};
+    const promotion = limit.promotion || {};
+    const ladder = list(report.ladder).filter((r) => numeric(r.height)).sort((a, b) => Number(a.height) - Number(b.height));
+    const maximum = Math.max(1, ...ladder.map((r) => Number(r.count) || 0));
+    const chart = ladder.length ? `<div class="ladder-chart" role="img" aria-label="连板梯队家数">${ladder.slice(0, 10).map((r) => `<div class="ladder-column"><span>${esc(num(r.count, 0))}</span><i style="height:${clamp(Number(r.count) / maximum * 60, 2, 60)}px"></i><small>${esc(num(r.height, 0))}板</small></div>`).join('')}</div>` : '';
+    const trends = list(report.trend);
+    const recent = trends.slice(-5);
+    $('review-trend').innerHTML = `<div class="trend-fact"><span>昨日涨停今日晋级</span><strong>${esc(num(promotion.promoted_count, 0))} / ${esc(num(promotion.previous_count, 0))}</strong></div><div class="trend-fact"><span>涨停延续率</span><strong>${numeric(promotion.rate_pct) ? `${esc(num(promotion.rate_pct, 1))}%` : '—'}</strong></div>${chart}${recent.length ? '<h3 class="small-title">最近交易日走势</h3>' : ''}${recent.map((r) => `<div class="history-item"><span>${esc(r.date)}</span><span>涨停 ${esc(num(r.limit_up_count, 0))}</span><span>${esc(num(r.max_consecutive, 0))} 板</span></div>`).join('')}<p class="trend-note">${esc(report.ladder?.limitation || '延续率为昨日涨停股在今日继续涨停的比例。连板高度依据可用历史和官方字段，缺失项保持未知。')}</p>`;
+  }
+
+  function renderLLMConfig(llm, jobs) {
+    const profiles = list(llm.profiles);
+    const active = llm.active_provider || 'custom';
+    const profile = profiles.find((item) => item.id === active) || {id: active, label: llm.label || 'AI', model: llm.model, base_url: llm.base_url, configured: llm.configured};
+    const changed = state.llmProvider !== active;
+    const signature = JSON.stringify([active, profile.model, profile.base_url]);
+    if (changed) { state.llmDirty = false; $('llm-key').value = ''; }
+    if (profiles.length) {
+      const optionsSignature = JSON.stringify(profiles.map((item) => [item.id, item.label]));
+      for (const id of ['llm-provider', 'llm-review-provider']) {
+        if ($(id).dataset.signature !== optionsSignature) {
+          $(id).replaceChildren(...profiles.map((item) => { const option = document.createElement('option'); option.value = item.id; option.textContent = item.label; return option; }));
+          $(id).dataset.signature = optionsSignature;
+        }
+      }
+    }
+    if (!state.llmSwitching) { $('llm-provider').value = active; $('llm-review-provider').value = active; }
+    if (changed || (!state.llmDirty && signature !== state.llmSignature)) {
+      $('llm-model').value = profile.model || '';
+      $('llm-base').value = profile.base_url || '';
+      $('llm-model-options').replaceChildren(...list(profile.models).map((model) => { const option = document.createElement('option'); option.value = model; return option; }));
+      state.llmSignature = signature;
+    }
+    $('llm-base').readOnly = active !== 'custom';
+    if (changed) document.querySelector('.llm-advanced').open = active === 'custom';
+    $('llm-key').placeholder = profile.has_key ? '当前服务已保存 Key；留空保留，输入可替换' : `输入 ${profile.label} 的 API Key`;
+    text('llm-config-status', profile.configured ? `${profile.label} · 已配置` : `${profile.label} · 待配置`);
+    $('llm-config-status').className = `pill ${profile.configured ? 'green' : 'amber'}`;
+    text('llm-ready', `${profile.label} · ${profile.configured ? profile.model || '已配置' : '请先保存 Key'}`);
+    text('llm-provider-help', active === 'custom' ? '此配置只用于所填服务。变更服务地址时请重新提供该服务的 Key，保存不调用模型。' : `${profile.label} 的官方地址与默认模型已预设，填 Key 并保存即可。切换服务不会转移另一家的密钥。`);
+    const test = llm.connection_test;
+    text('llm-test-status', jobs.llm_test?.status === 'running' ? '正在检查认证与模型列表…' : jobs.llm_test?.status === 'error' ? `连接测试失败：${jobs.llm_test.message}` : test && test.provider === active ? test.message || (test.ok ? '连接正常，尚未生成回答。' : '连接未通过，请检查配置。') : '测试仅检查认证和模型列表，不生成回答。修改后请先保存再测试。');
+    state.llmProvider = active;
+  }
+
+  async function switchLLM(provider, source) {
+    if (state.llmSwitching || provider === state.llmProvider) return;
+    state.llmSwitching = true;
+    $('llm-provider').disabled = true; $('llm-review-provider').disabled = true;
+    try {
+      const ok = await mutate('/api/llm-select', {provider}, '已切换 AI 服务');
+      if (ok) { $('llm-key').value = ''; state.llmDirty = false; }
+    } finally {
+      state.llmSwitching = false;
+      $('llm-provider').disabled = false; $('llm-review-provider').disabled = false;
+      renderLLMConfig(state.snapshot?.llm || {}, state.snapshot?.jobs || {});
+    }
+  }
+
+  function renderLLM(llm, job) {
+    const result = llm.result;
+    let output;
+    if (job?.status === 'running') output = job.message || 'AI 正在分析复盘报告，请稍候…';
+    else if (llm.error || job?.status === 'error') output = `AI 分析失败：${llm.error || job.message}`;
+    else if (typeof result === 'string' && result) output = result;
+    else if (result && typeof result === 'object') output = result.content || result.text || result.analysis || JSON.stringify(result, null, 2);
+    else output = '生成复盘并配置模型后，可请求文字分析。输出保留原始数据边界与缺失项。';
+    if (result && typeof result === 'object' && job?.status !== 'running' && job?.status !== 'error') {
+      const reportScope = result.scope === 'review' ? ` · 报告 ${result.review_date || '日期未标注'}` : '';
+      const staleReview = result.scope === 'review' && !matchingReviewAI() ? '这份研判来自其他日期或版本的报告，不能附入当前报告。可重新生成当前报告的文字分析。\n\n' : '';
+      output = `${result.mode === 'demo' ? '【模拟数据分析】' : '【实盘数据研究】'} ${result.label || llm.label || ''}${result.model ? ` · ${result.model}` : ''}${reportScope}${result.generated_at ? ` 生成于 ${time(result.generated_at, true)}` : ''}\n\n${staleReview}${output}`;
+    }
+    text('llm-output', output);
+  }
+
+  function renderErrors(snapshot) {
+    const errors = [...list(snapshot.errors), ...list(snapshot.auction?.summary?.warnings)];
+    $('errors-panel').classList.toggle('hidden', !errors.length);
+    $('errors-list').innerHTML = errors.slice(-12).map((error) => `<li>${esc(typeof error === 'string' ? error : [error.time || error.at, error.message || error.error || JSON.stringify(error)].filter(Boolean).join(' · '))}</li>`).join('');
+  }
+
+  function tick() {
+    text('clock', time(new Date().toISOString()));
+    const auction = state.snapshot?.auction || {};
+    const latest = auction.summary?.last_received_at || list(auction.rows).reduce((last, row) => row.updated_at && (!last || row.updated_at > last) ? row.updated_at : last, '');
+    const age = latest ? Math.max(0, (Date.now() - new Date(latest).getTime()) / 1000) : null;
+    const demo = state.snapshot?.mode === 'demo';
+    $('freshness-value').innerHTML = demo ? '<span style="font-size:21px">模拟时间</span>' : `${esc(num(age, 0))}<small> 秒</small>`;
+    text('freshness-note', latest ? `${demo ? '模拟观测' : '最新本地接收'} ${time(latest)}${demo ? '' : ' · 非交易所时延'}` : '基于最近一次本地采集时间');
+  }
+
+  function setConnection(label, mode) {
+    text('connection', label);
+    $('connection').className = `connection ${mode || ''}`;
+  }
+
+  async function fetchState() {
+    if (polling) return;
+    polling = true;
+    try {
+      render(await api('/api/state'));
+      if (!state.connected) setConnection('轮询连接', 'polling');
+      $('notice').classList.add('hidden');
+    } catch (error) {
+      setConnection('服务未连接', '');
+      text('notice', `无法连接本地服务：${error.message} 请确认启动窗口保持运行。系统将自动重试。`);
+      $('notice').classList.remove('hidden');
+    } finally { polling = false; }
+  }
+
+  function startPolling() { if (!pollTimer) pollTimer = setInterval(fetchState, 5000); }
+  function connectEvents() {
+    if (!window.EventSource) { startPolling(); return; }
+    const events = new EventSource('/api/events');
+    events.onopen = () => {
+      state.connected = true;
+      setConnection('实时推送已连接', 'online');
+      if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      $('notice').classList.add('hidden');
+    };
+    events.addEventListener('state', (event) => {
+      try { render(JSON.parse(event.data)); }
+      catch { text('notice', '实时消息无法读取，正在重新获取状态。'); $('notice').classList.remove('hidden'); fetchState(); }
+    });
+    events.onerror = () => { state.connected = false; setConnection('正在恢复连接', 'polling'); startPolling(); };
+    window.addEventListener('pagehide', () => { events.close(); if (pollTimer) clearInterval(pollTimer); });
+  }
+
+  document.addEventListener('click', async (event) => {
+    const nav = event.target.closest('[data-tab],[data-open]');
+    if (nav) { showPage(nav.dataset.tab || nav.dataset.open); return; }
+    const stockQuery = event.target.closest('[data-query-stock]');
+    if (stockQuery) { await queryStock(stockQuery.dataset.queryStock, stockQuery); return; }
+    const stockAdd = event.target.closest('[data-add-stock]');
+    if (stockAdd) { await addWatchlist(stockAdd.dataset.addStock, stockAdd); return; }
+    const stockRemove = event.target.closest('[data-remove-stock]');
+    if (stockRemove) { await mutate('/api/watchlist/remove', {code: stockRemove.dataset.removeStock}, '已取消自选来源', stockRemove); return; }
+    const stockAction = event.target.closest('[data-stock-action]');
+    if (stockAction?.dataset.stockAction === 'add-current') { await addWatchlist($('stock-code').value || state.snapshot?.stocks?.analysis?.thscode, stockAction); return; }
+    if (stockAction?.dataset.stockAction === 'refresh-trends') { await mutate('/api/trends/refresh', {}, '趋势池刷新已提交', stockAction); return; }
+    const filter = event.target.closest('[data-filter]');
+    if (filter) {
+      state.filter = filter.dataset.filter;
+      document.querySelectorAll('[data-filter]').forEach((el) => el.classList.toggle('selected', el === filter));
+      renderAuction(); return;
+    }
+    const row = event.target.closest('[data-symbol]');
+    if (row) { selectStock(row.dataset.symbol); return; }
+    const action = event.target.closest('[data-action]');
+    if (!action) return;
+    const name = action.dataset.action;
+    if (name === 'llm' && !state.snapshot?.llm?.configured) { showPage('settings'); toast('请先保存 AI 接口与模型。', true); return; }
+    if (name === 'llm' && !state.snapshot?.review && !list(state.snapshot?.auction?.rows).length && !state.snapshot?.stocks?.analysis) { toast('请先采集竞价数据、查询个股或生成收盘复盘报告。', true); return; }
+    const body = name === 'review' ? {date: $('review-date').value || undefined} : name === 'llm' ? {question: $('llm-question').value.trim(), provider: state.llmProvider, ...(state.snapshot?.review?.date ? {review_date: state.snapshot.review.date, review_id: state.snapshot.review_id} : {})} : {};
+    await mutate(`/api/${name}`, body, {prepare: '已开始准备关注池', start: '已启动监测', stop: '已停止监测', review: '已开始生成复盘', demo: '已切换到明确标记的模拟演示', llm: '已提交 AI 分析'}[name], action);
+    if (name === 'demo') showPage('auction');
+  });
+
+  document.addEventListener('keydown', (event) => {
+    if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('[data-symbol]')) { event.preventDefault(); selectStock(event.target.dataset.symbol); }
+  });
+  $('symbol-search').addEventListener('input', (event) => { state.search = event.target.value.trim().toLowerCase(); renderAuction(); });
+  $('watchlist').addEventListener('input', () => { state.watchlistSettingsDirty = true; });
+  $('review-date').addEventListener('input', () => { state.reviewDateTouched = true; });
+  $('report-save').addEventListener('click', saveMarkdown);
+  $('report-load').addEventListener('click', loadSavedReport);
+  $('report-history-refresh').addEventListener('click', loadReports);
+  $('report-history-date').addEventListener('change', renderReportControls);
+  $('comparison-baseline').addEventListener('change', () => { resetComparison(); renderReportControls(); });
+  $('comparison-run').addEventListener('click', compareReports);
+  $('diagnostics-refresh').addEventListener('click', loadDiagnostics);
+  window.addEventListener('hashchange', () => showPage(location.hash.slice(1) || 'auction'));
+  $('toggle-errors').addEventListener('click', () => { const closed = $('errors-list').classList.toggle('hidden'); text('toggle-errors', closed ? '展开' : '收起'); });
+  $('weights-editor').addEventListener('input', (event) => {
+    const target = event.target;
+    const key = target.dataset.weightRange || target.dataset.weight;
+    if (!key) return;
+    const selector = target.dataset.weightRange ? '[data-weight]' : '[data-weight-range]';
+    const partner = [...$('weights-editor').querySelectorAll(selector)].find((el) => (el.dataset.weight || el.dataset.weightRange) === key);
+    if (partner) partner.value = target.value;
+    updateWeightTotal();
+  });
+
+  $('credentials-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const key = $('api-key').value.trim();
+    if (!key) return;
+    const ok = await mutate('/api/credentials', {api_key: key}, '数据源密钥已保存', event.submitter);
+    if (ok) $('api-key').value = '';
+  });
+  $('stock-query-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await queryStock($('stock-code').value, event.submitter);
+  });
+  $('watchlist-add-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    await addWatchlist($('watchlist-batch').value, event.submitter);
+  });
+  $('runtime-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const watchlist = [...new Set($('watchlist').value.split(/[\s,，;；]+/).map((value) => value.trim().toUpperCase()).filter(Boolean))];
+    if ($('universe').value === 'watchlist' && !watchlist.length) { toast('自选股池至少需要一个股票代码。', true); return; }
+    const savedWatchlist = state.snapshot?.config?.watchlist || [];
+    const added = watchlist.filter((code) => !savedWatchlist.includes(code));
+    if (added.length) { $('watchlist-batch').value = added.join(', '); showPage('stocks'); toast('新增代码需要核验，已带入个股查询页的批量自选输入框；采集设置尚未保存。'); return; }
+    const ok = await mutate('/api/config', {universe: $('universe').value, poll_seconds: Number($('poll-seconds').value), watchlist}, '采集设置已保存', event.submitter);
+    if (ok) state.watchlistSettingsDirty = false;
+  });
+  $('weights-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const weights = Object.fromEntries([...document.querySelectorAll('[data-weight]')].map((el) => [el.dataset.weight, Number(el.value) / 100]));
+    if (Object.values(weights).some((value) => !Number.isFinite(value) || value < 0) || !Object.values(weights).some((value) => value > 0)) { toast('权重必须为非负数字，且至少一个因子权重大于零。', true); return; }
+    const total = Object.values(weights).reduce((a, b) => a + b, 0);
+    const normalized = Object.fromEntries(Object.entries(weights).map(([key, value]) => [key, value / total]));
+    const ok = await mutate('/api/config', {weights: normalized}, '因子权重已保存', event.submitter);
+    if (ok) initializeWeights(state.snapshot?.config?.weights || normalized);
+  });
+  $('llm-form').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const body = {provider: state.llmProvider, base_url: $('llm-base').value.trim(), model: $('llm-model').value.trim()};
+    if ($('llm-key').value.trim()) body.api_key = $('llm-key').value.trim();
+    const ok = await mutate('/api/llm-config', body, '当前 AI 配置已保存', event.submitter);
+    if (ok) { $('llm-key').value = ''; state.llmDirty = false; state.llmSignature = ''; renderLLMConfig(state.snapshot?.llm || {}, state.snapshot?.jobs || {}); }
+  });
+  for (const id of ['llm-key', 'llm-model', 'llm-base']) $(id).addEventListener('input', () => { state.llmDirty = true; });
+  for (const id of ['llm-provider', 'llm-review-provider']) $(id).addEventListener('change', (event) => switchLLM(event.target.value, event.target));
+  $('llm-test').addEventListener('click', async (event) => {
+    if (state.llmDirty) { toast('请先保存当前 Key 或模型修改，再测试连接。', true); return; }
+    await mutate('/api/llm-test', {provider: state.llmProvider}, '已提交连接检查', event.currentTarget);
+  });
+
+  $('review-date').value = dateAtShanghai();
+  initializeWeights();
+  showPage(location.hash.slice(1) || 'auction');
+  tick();
+  setInterval(tick, 1000);
+  fetchState();
+  startPolling();
+  connectEvents();
+})();

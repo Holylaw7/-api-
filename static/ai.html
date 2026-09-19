@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>AI 研究助手 · DeepSeek / ChatGPT</title>
+  <link rel="stylesheet" href="/ai.css">
+  <script src="/ai.js" defer></script>
+</head>
+<body>
+  <div class="studio">
+    <header class="header"><a class="brand" href="/ai.html"><span class="brand-icon" aria-hidden="true">✳</span><span>AI 研究助手<small>YOUR LOCAL AI WORKSPACE</small></span></a><div class="header-actions"><a href="http://127.0.0.1:8765" target="_blank" rel="noopener">竞价研究台 ↗</a><span id="connection" class="connection">连接中</span></div></header>
+    <div id="notice" class="notice hidden" role="status"></div>
+    <div class="intro"><div><span class="eyebrow">ONE WORKSPACE · TWO PERSPECTIVES</span><h1>选择你的 AI，开始研究。</h1><p>DeepSeek 与 ChatGPT 一键切换。填入对应的 API Key，即可独立对话。</p></div><div class="local-label"><i></i> 本机独立运行</div></div>
+    <main class="workspace">
+      <aside class="settings">
+        <section class="panel provider-panel"><div class="panel-heading"><span class="step">01</span><h2>选择 AI</h2></div><div id="provider-options" class="provider-options" role="group" aria-label="选择 AI 服务商"></div><p id="active-description" class="help">正在读取服务配置…</p></section>
+        <section class="panel config-panel"><div class="panel-heading"><span class="step">02</span><h2>连接你的账户</h2><span id="key-status" class="badge">待配置</span></div><form id="profile-form"><label for="api-key">API Key</label><input id="api-key" type="password" autocomplete="new-password" spellcheck="false" placeholder="粘贴当前服务商的 API Key"><p id="key-help" class="help">Key 保存在本机用户凭据目录，页面不会回显。</p><details id="advanced"><summary>模型与高级设置 <span id="model-summary"></span></summary><div class="advanced-fields"><label for="model">模型</label><input id="model" list="model-options" placeholder="模型名称" maxlength="160" required><datalist id="model-options"></datalist><label for="base-url">服务地址</label><input id="base-url" type="url" placeholder="https://your-provider.example/v1" autocomplete="off" required readonly><p id="base-help" class="help">官方服务地址已预设。</p></div></details><div class="form-actions"><button class="button primary" id="save-profile" type="submit">保存 Key 与配置</button><button class="button" id="test-profile" type="button">测试连接</button></div><p id="test-status" class="test-status" role="status">测试连接只检查认证与模型列表，不生成回答。</p></form><div class="account-note">DeepSeek 与 OpenAI 使用各自的 API Key。这里的 ChatGPT 通过 OpenAI API 接入，需填写 API Key；无需在本程序登录 ChatGPT。</div></section>
+        <section class="panel market-panel"><div class="panel-heading"><span class="step">03</span><h2>可选 · 盘面上下文</h2></div><p class="help">从竞价研究台或本机历史报告读取摘要。先预览，再决定是否随问题发送给当前 AI。</p><button id="load-context" class="button full" type="button">读取本机盘面摘要 ↗</button><p id="context-status" class="context-status">未加载。独立聊天不需要启动竞价研究台。</p><details id="context-details" class="hidden"><summary>查看将发送的数据</summary><pre id="context-preview"></pre></details><label class="checkbox-label"><input id="include-market" type="checkbox" disabled><span>本次提问附带这份盘面摘要</span></label></section>
+      </aside>
+      <section class="panel chat-panel" aria-label="AI 对话"><div class="chat-heading"><div><div class="chat-caption">当前对话</div><h2 id="chat-title">AI 研究助手</h2><p id="chat-model">正在连接本机服务…</p></div><button id="clear-chat" class="text-button" type="button">清空对话</button></div><div id="conversation" class="conversation" aria-live="polite" aria-relevant="additions text"><div class="chat-empty"><span class="empty-mark" aria-hidden="true">✳</span><h3>把问题交给你选择的 AI</h3><p>左侧保存 Key 后，直接输入问题。<br>两家服务分别在本机保留对话，切换时不会互相传递历史。</p><div class="prompt-examples"><button type="button" data-prompt="请帮我建立一个观察早盘竞价强弱的清单，区分可验证数据和主观假设。">建立竞价观察清单 <span>↗</span></button><button type="button" data-prompt="研究涨停与连板股时，应该如何比较封板质量、梯队延续和板块共振？">梳理连板研究思路 <span>↗</span></button></div></div></div><div id="job-status" class="job-status" role="status">准备就绪</div><form id="chat-form" class="composer"><label for="message" class="sr-only">输入问题</label><textarea id="message" placeholder="向当前 AI 提问…" rows="3" maxlength="8000" required></textarea><div class="composer-bottom"><span id="send-context-note">本次不附加盘面摘要；会发送当前服务的对话历史</span><button id="send-message" class="button primary" type="submit">发送问题 <span aria-hidden="true">↑</span></button></div></form><footer class="chat-footer">AI 回答可能有误，涉及行情请核对数据日期与来源。模型调用在后台进行，不参与竞价采集与评分。</footer></section>
+    </main>
+    <footer class="footer"><span>AUCTION LAB / AI STUDIO</span><span>两个程序共享服务配置 · 模型不会自动切换</span></footer>
+  </div>
+  <div id="toasts" class="toasts" role="status"></div>
+</body>
+</html>

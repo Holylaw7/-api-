@@ -1,0 +1,173 @@
+# 架构与二次开发
+
+版本1.3。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。
+
+## 模块与数据流
+
+```text
+同花顺 REST / 用户提供的模型 API
+       ↓                 ↑ 点击才调用
+provider.py           llm.py
+       ↓                 ↑ 结构化摘要
+service.py → engine.py → 内存最新排名 → SSE → 本机浏览器
+       ↓
+storage.py → SQLite / JSON / Markdown 报告
+       ↑
+review.py → 全池复盘、连板趋势、板块成交参与度
+stocks.py → 单股日线研究 → stocks/个股日期.json
+selection.py → 有限候选趋势筛选 → trend-pool.json → 下一会话重点池
+report_library.py ↔ storage.py / 报告JSON → reporting.py → Markdown保存与下载
+insights.py → 两期报告比较 / 本机就绪检查（不请求行情）
+```
+
+全项目 Python 标准库，前端原生 HTML/CSS/JS，无第三方 CDN。Windows 使用固定 UTC+08:00（Asia/Shanghai 现代交易时区），不依赖系统时区数据库。所有入库时间包含偏移。
+
+## 调度状态
+
+日历来自官方近一年交易日历，不能以“周一到周五”代替。每天重新读取日历和上一交易日涨停池。目录准备失败则显示错误并每分钟有界再准备；日历未知不当成已知交易日采集。
+
+| 时段 | 行为 |
+|---|---|
+| 建议09:05前启动 | 准备昨日池、趋势池与证券目录；09:10前完成准备；恢复同日真实批次 |
+| 09:10–09:26（含整分钟） | 竞价优先；个股日线延后，拒绝新复盘/手动趋势刷新，进行中的趋势筛选在下次取数前停止 |
+| 09:15:00–09:19:59 | `stage=live`，每批落盘、增量评分、推送 |
+| 09:20:00–09:24:59 | 继续 `live`，计算后段斜率与金额留存 |
+| 09:25:00–09:26:00 | 逐批 `final`；只请求未完成的证券 |
+| 09:26 后 | 停止竞价请求；保留终态或明确待核验的最后观察 |
+| 09:27起 | 执行待处理个股日线；自动重试被保护时段打断的趋势筛选 |
+| 15:10 后 | 自动生成当日复盘；完成后触发趋势池再筛选，利用当天活跃股准备下次会话 |
+
+当请求跨越 09:25 返回，保留真实接收时间，不倒填成 09:24:59。实时端点每批不在网络层重试，下一轮按调度重试；一般 REST 最多重试 3 次。限流和无效密钥不会立即重复轰炸接口。复盘在独立线程进行，09:10–09:26 禁止开始新的复盘任务。系统不宣称操作系统调度或网络具有硬实时保证。
+
+关注池构建与观察引擎分离。`_rebuild_codes()` 在锁内根据 `manual`、`previous_limit_up`、`strong_trend` 合并，`all` 模式再加 `all_market`。增删自选只改成员和来源，不调用引擎reset；在途一轮使用已拷贝的代码列表，新加入者从下一轮开始。只有切换真实会话/演示或重建新会话才按恢复流程处理引擎。移除后若仍有自动来源则继续跟踪；旧观察保留。
+
+趋势池按截止日匹配上一交易日。`session_trends` 保留本次会话使用的旧池，收盘后新生成的下一次池不会反向改写本次竞价来源。纯自选模式不自动合入涨停或趋势池。趋势筛选以 `should_stop` 检查关闭和保护时段，中断后清除本次自动尝试标记以便稍后重试；同日已完成池不会被中断的partial结果覆盖。
+
+个股查询先精确解析代码。只含完整代码的缓存条目不能据此证明六位裸代码唯一；裸代码复用须具备该裸代码的官方解析凭据，否则重新查询官方搜索。`stocks.py` 只请求一只股截至已收盘日的前复权历史，不触发全市场、竞价或模型调用。保护时段将单个待处理查询存在 `pending_stock`，新延后查询覆盖上一次；SSE仍展示本机已有观察。
+
+## 增量计算契约
+
+`AuctionEngine.ingest(data, received_at, context)` 每收到一批调用一次。context 仅允许交易日前的上下文；同日/未来数据拒绝，避免盘前使用收盘后的已知涨停结果。上游 `null` 不补零；未匹配量因单位/方向未明确，不推断买压。
+
+每条分数包含原值、子分数、权重、贡献、数据覆盖和质量说明。有重复请求、未就绪、迟到、缺值时保留诊断。分数和因子可供另一个 AI 使用，但必须一并传递质量说明。严格连板数不能从 `5天4板` 的计数直接推成 4 连板。
+
+09:25 之后 root service 只允许临近截止 30 秒内的既有有效分数以 `is_provisional=true` 展示；终态未确认会显示质量标记，次日不沿用。原始引擎保持过期排除规则。
+
+## 本机 HTTP 接口
+
+仅监听 `127.0.0.1:8765`。浏览器界面无外部服务端，接口不提供跨站 CORS。
+
+| 方法与路径 | 说明 |
+|---|---|
+| GET `/api/health` | 本服务识别和版本 |
+| GET `/api/state` | 全部页面所需公开状态，不含密钥 |
+| GET `/api/events` | `event: state` 的 Server-Sent Events，断线可重连 |
+| GET `/api/history?symbol=完整代码` | 当前会话已采集该股原始观察 |
+| GET `/api/report` | 当前或指定date的复盘，format=json/markdown；Markdown可选同版本AI附录与baseline对比 |
+| GET `/api/reports` | 当前模式的本机历史目录，最多365个日期 |
+| GET `/api/reports/compare` | date/baseline两期本机报告比较，不重新采集 |
+| GET `/api/reports/download` | filename/mode/sha256校验后的已保存Markdown下载 |
+| GET `/api/diagnostics` | 已知本机状态的就绪检查，不远程验证授权 |
+| POST `/api/start` `/api/stop` | 启动/停止自动采集 |
+| POST `/api/prepare` | 后台准备股票池 |
+| POST `/api/review` | `{"date":"YYYY-MM-DD"}`，日期可省略 |
+| POST `/api/reports/load` | `{"date":"YYYY-MM-DD"}`，读取实盘历史视图 |
+| POST `/api/reports/save` | `{date?,include_ai?,provider?,review_id?,baseline?}`，原子保存并返回带SHA-256的下载地址 |
+| POST `/api/demo` | 显式进入合成演示 |
+| POST `/api/config` | 合并并校验非敏感配置 |
+| POST `/api/watchlist/add` | `{"codes":["000001","600519.SH"]}`；也支持分隔文本；1–50只，保护时段每次1只；异步官方核验 |
+| POST `/api/watchlist/remove` | `{"code":"000001.SZ"}`；移除manual来源并保留观察；裸代码必须在自选中唯一 |
+| POST `/api/stocks/analyze` | `{"code":"000001","date":"YYYY-MM-DD"}`；date可省略；异步独立查询，不自动加自选 |
+| POST `/api/trends/refresh` | `{}`；按最近已收盘日后台刷新有限候选趋势池，保护时段拒绝开始 |
+| POST `/api/credentials` | 保存数据 Key 到用户凭据文件并启动 |
+| POST `/api/llm-config` | 保存模型端点、模型 ID、独立 Key |
+| POST `/api/llm` | question/provider可选；review_date/review_id限定为指定版本报告专属研判 |
+
+所有 POST 要求同源及 `X-Local-App: auction-lab`；请求 Host 必须是本机服务地址，降低跨站和 DNS 重绑定风险。GET 不回显凭据。静态文件是白名单，不能下载 SQLite、Python 源码或凭据。远程 LLM 强制 HTTPS，重定向禁止转发 Key。
+
+复盘、添加自选、个股分析、趋势刷新、AI生成和AI连接测试响应含 `{ok,message,started}`。`started=false` 表示同名任务已在运行，并非又启动一个任务。`jobs` 的键包括 `prepare/review/llm/llm_test/stock/watchlist/trends`，每个值为 `{status:'running'|'done'|'error',message}`。保护时段个股任务可能已经 `done`，但 `stocks.analysis.status='deferred'`，表示日线在等待09:27，不应当显示计算成功或零分。
+
+新增公开状态为：
+
+```text
+stocks = {
+  query_code,
+  watchlist: [{thscode,name,sources,tracking}],
+  analysis: null | {
+    thscode,name,date,status,trend,trend_score,trend_factors,trend_coverage,
+    history,warnings,source,score_method,
+    auction:{row,history,date,mode,tracking,scope_count}
+  },
+  trend_pool:{date,status,rows,candidate_count,evaluated_count,
+              valid_history_count,selected_count,coverage,warnings,...}
+}
+auction.source_counts = {manual,previous_limit_up,strong_trend}
+auction.rows[].sources = ['manual', ...]
+```
+
+`analysis.date` 是日线截止日，`analysis.auction.date` 是本机竞价会话日。后者附加于公开快照，不通过实时HTTP补取历史竞价。`tracking` 说明是否属于当前正在采集范围；有旧观察但已移出范围时不再给当前范围名次。GET状态递归去除大体积 `raw`，完整复盘由导出与落盘文件保留。
+
+## 持久化与恢复
+
+SQLite 表 `batches` 保存 `session_date, mode, received_at, stage, payload`。mode 有 `live` 和 `demo`，查询必须显式按 mode 分离。表 `reports` 按日期与模式保存最新复盘。原始数据与 derived 分数独立，修改策略后可以用原始批次重建；重新评分与最初实时可见结果应区别记录。
+
+复盘 JSON 保留 raw 字段作为证据，网页主要展示 derived 部分。写 JSON 使用临时文件再原子替换。用户凭据文件和模型配置位于项目外部；备份项目目录不自动备份 Key。
+
+| 文件 | 内容与复用边界 |
+| --- | --- |
+| `data/stock-metadata.json` | 以完整代码为键保存官方代码、名称、资产类别及 `resolution`；缓存不能绕过裸代码歧义校验 |
+| `data/trend-pool.json` | 最近一次趋势筛选结果、截止日、候选覆盖、评分及警告；加载后须按会话上一交易日核对 |
+| `data/stocks/代码-日期.json` | 独立单股日线结果，如 `600519.SH-2026-09-18.json`；前复权口径和来源完整保存 |
+| `data/config.json` | 自选完整代码和非敏感设置；代码按字符串保存，不能丢失前导零 |
+
+演示中拒绝真实股票查询、自选增删、真实准备和趋势刷新；公开状态不展示真实个股分析或趋势池为演示信号。回到真实模式后继续使用真实持久化数据。退出服务会丢失尚未执行的内存延后查询，需重新提交；已保存的日线结果和观察仍在本机。
+
+`_complete_trend_cache(pool,date)` 区分“取数已完成”与“没有质量提示”。同日ready结果可复用；partial若已处理全部候选、至少5日池齐全、没有history失败或保护中断，并有completed_at，也可复用。短上市历史或日期推断警告仍保留，但不会导致每次重启重新下载60只日线。中断、实际请求失败和候选未完成不满足此条件；最新复盘完成后仍会显式要求再筛选。
+
+## 扩展策略
+
+改权重：页面直接编辑；修改生效前必须停止采集。默认七因子加总归一化。新增因子：修改 `engine.py` 的因子定义与归一化、`config.py` 校验、前端名称映射、策略文档及有意义的时序测试，不能只改 UI。
+
+改数据源：实现 `HiThinkProvider` 对应方法，保留标准字段、时间、单位、分页完成语义。股票池返回失败不能转换为成功空列表。
+
+改个股或自动筛选：分别修改 `stocks.py` 与 `selection.py` 的公式，不共用两个同名 `_trend_score` 的含义。同步公式说明、硬阈值、覆盖率单位和前端标签；保持单股40交易日/一次日线请求、筛选60候选/30入选上限与保护时段。`selection.py` 不写磁盘，缓存及会话合并由service负责。
+
+接真实资金流：`review.py` 的 `CapitalFlowSource` 定义扩展协议，提供 `sector_flows(date, sector_codes)`；需返回数据源、交易日、币种、资金口径及原始时间。协议仅为扩展接口，当前未安装外部资金源、未自动调用、不承诺已有真实净流。接入后另建净资金排行，不替换“成交参与度”字段。概念板块成分可能重叠，不能跨板块加总金额。
+
+改 LLM：`ai_gateway.py` 统一服务商配置、模型列表检查和文本生成；DeepSeek/自定义使用 Chat Completions，OpenAI 使用 Responses。`llm.py` 只构造递归白名单盘面摘要。只接收白名单市场摘要、在独立后台任务运行、错误不影响数值策略。不能把模型文本作为委托指令。
+
+## 性能与验收
+
+API 每批 100，串行请求优先保证限流安全。服务每批排名，SSE 刷新后浏览器读取，不等收齐所有批次。全市场上限由网络时延与官方频率限制决定，不能用 UI 的 3 秒配置冒充每只股票真实 3 秒更新。
+
+SSE以service.version检查状态变更，变更后立即发完整状态，每批到达仍走原增量发布路径。无变更时condition最长等待3秒，发送轻量注释keepalive；普通闲时每15秒补完整状态，09:10–09:26保护时段每3秒补状态，更新时钟与陈旧提示。客户端重连建议2秒。完整状态刷新间隔与金融API轮询间隔不是同一概念。报告identity按发布对象缓存，避免每次SSE重算大报告指纹；不得通过原地修改报告破坏缓存假设。
+
+## 本机报告库与版本绑定（1.3）
+
+`Store.list_reports(mode,limit)`只查日期、模式、生成时间，最多365行，不解码每份大型raw。`ReportLibrary.list()`合并SQLite与相应模式目录的JSON日期；读取优先SQLite，缺记录才回退本机JSON，并验证日期和模式。历史读取、比较、保存、下载和就绪检查均不会重新调用金融数据服务。用户主动生成复盘仍走原后台采集与保护时段规则。
+
+Service分开维护`review`、`latest_review`和`viewing_archive`。前者只代表用户当前看的报告，后两者让自动复盘与下一会话趋势准备跟随最新真实报告。载入旧报告不改latest_review；自动生成完成时只在未查看历史情况下切换当前视图；手动生成会切换。自动调度判断当日是否已完成使用latest_review，避免仅因看了旧报告就重复发起当日取数。
+
+报告完成后先落SQLite与JSON、生成Markdown，再发布完整对象。**发布后的报告对象不可原地修改**；任何修订都创建新报告对象。`report_identity()`规范序列化公开证据并取SHA-256，递归排除raw、凭据敏感键、身份及导出/AI/对比元数据；保留生成和完成时间。`_review_identity()`按对象身份缓存哈希，公开状态新增`review_id`。保存或专属AI提交`review_id`后，版本不同则拒绝，不将相同日期的两次报告误认同一份。
+
+`reporting.render_markdown`是纯函数；展示市场、涨停前30、板块前30、逐日梯队、日线趋势、覆盖与全部公开质量警告，并提供基于前10涨停强度对象的下一交易日观察清单。名单仅供后续核验，不自动加入关注。文本进行Markdown/HTML转义，模型附录作为引用文本，不允许模型内容变为可执行HTML。`compare_reports`同样纯计算，完整池核验后按全代码比较；非相邻交易日不声称昨日晋级或断板，日期推断和连板下限保留provisional。板块只说明相对涨幅、成交额变化与样本排名，不把它们命名为净流入。
+
+保存使用同目录临时文件、UTF-8与LF、flush/fsync后os.replace。实盘Markdown路径为`data/reports/YYYY-MM-DD.md`，带AI为`YYYY-MM-DD-with-ai-provider.md`；演示使用`data/reports/demo/`。固定有效日期和服务商枚举组成文件名，下载端不接收路径；下载大小上限4MB，并可验证保存时返回的字节SHA-256。同名文件会被新保存原子替换，旧校验值下载失败可避免保存与下载之间取到不同版本；这不是无限版本归档。GET动态Markdown导出不写盘，POST保存返回path、filename、date、mode、review_id、sha256及download_url。
+
+专属报告AI请求携带`review_date`，只将该报告的白名单摘要送入模型，移除当前竞价与个股数据；`scope='review'`结果绑定日期、模式、服务商、模型和review_id。`scope='market'`的综合盘面解释不得附入报告。专属结果按`data/ai-reviews/{mode}/YYYY-MM-DD-{provider}.json`保存安全白名单，可重启恢复；所有绑定字段匹配才能显示或附录。在途结果遇历史视图切换时保留独立归档但不写入另一报告视图，遇数据模式切换则丢弃。保存带AI报告只读取已有对应结果，不隐式再次调用付费AI。
+
+`readiness(snapshot,internal)`只使用本地公开状态及prepared_date/calendar_loaded_date。时点由snapshot.now提供，日历必须今日核验；休市不要求本日终态。竞价活动时检查监测、关注池、接收年龄和覆盖，收尾后缺终态仅提示；自选模式不要求趋势池；未知mode明确错误。返回诊断是本机已知状态，不代表远程接口鉴权、上游时效或整段竞价已成功验证。
+
+接入新数据源后至少用一个真实交易日验收：09:05前启动、09:10前完成准备；09:15检查首批；09:20检查阶段；09:25检查现有排名和终态覆盖；保存一轮耗时/每股覆盖；15:10检查日期与完整池。模拟回放只能证明程序顺序与算法边界，不能证明线上时延。
+
+## 独立 AI 应用（1.2）
+
+`启动AI助手.cmd → launch_ai.py → run_ai.py → ai_studio.py` 单独监听127.0.0.1:8766，不创建行情Service或采集线程。静态界面为`ai.html/ai.css/ai.js`。主系统8765与助手8766共享用户级`ai-profiles.json`；网关使用跨进程文件锁与原子替换，避免两个界面保存时互相覆盖。
+
+DeepSeek和OpenAI的地址固定；只有custom允许输入自定义地址。保存配置与选择服务商是两个操作，空Key保留同一家已保存值，不从其他服务继承。首次运行默认DeepSeek，旧版模型配置作为custom兼容读入。GET状态只返回has_key/configured等状态，不返回Key。主系统AI结果与独立助手历史都按服务商分隔。
+
+发送聊天或市场分析时捕获服务商、模型和Key快照；执行途中切换不转移在途请求或回复。独立助手最多一个AI任务，按服务商持久化有限聊天历史。网络生成在后台线程执行，不持有竞价引擎锁；没有自动重试付费POST，没有失败后自动换服务商。
+
+助手仅在用户加载摘要时访问固定本机8765状态，连接失败则检查已保存报告。递归白名单位于`llm.MARKET_FIELDS`，增加可发送字段必须人工核对；排除raw、config、Key、本机路径及全量历史。默认聊天不附摘要，勾选后只附用户已预览的那份快照。未知字段默认留在本机。报告缓存不能宣称实时竞价。
+
+协议、运行步骤与官方依据见`docs/AI_ASSISTANT.md`；HTTP契约见`CONTRACT.md`。
