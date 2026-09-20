@@ -1,6 +1,8 @@
 # 数据来源、统计口径与扩展契约
 
-适用版本：1.3。原有采集与评分口径保持兼容；1.3 增加本机报告保存、历史比较和就绪检查。
+适用版本：1.4。原有采集与评分口径保持兼容；1.4 增加本机情绪结构、按报告日期手动读取风向标与龙虎榜，以及分页和限流处理。
+
+1.4 在2026-09-20重新核对用户指定的[官方完整指南 llms-full.txt](https://fuyao.aicubes.cn/llms-full.txt)、[REST 总览](https://fuyao.aicubes.cn/docs/api-reference/overview/)和[最佳实践](https://fuyao.aicubes.cn/best-practices/)。参数、字段和日期含义以现行REST契约为准；示例中的模拟数值不作为真实数据或时间规则。下方较早的仓库核对记录保留为历史背景。
 
 本系统依照 [HiThink-Tech/Financial-API 官方文档](https://github.com/HiThink-Tech/Financial-API/tree/main/docs/api)实现。开发核对日期：2026-09-19。主地址为 `https://fuyao.aicubes.cn`，认证字段为请求头 `X-api-key`。仅 `HTTP 200` **且** JSON 信封 `code == 0` 才属于成功；空数据、未就绪、权限错误、网络错误分别处理。
 
@@ -21,6 +23,8 @@
 | 板块行情 | `/api/a-share-index/prices/snapshot` | 必须传 `thscodes`；客户端以100个一批分组，覆盖所有目录板块 |
 | 当前板块成分 | `/api/a-share-index/constituents/ths-stock-list` | 单次一个指数；当前成分，不具备历史成分时点查询 |
 | 股票/指数日线 | `/api/{a-share,a-share-index}/prices/historical` | 单次一个代码，日线，最长10年；股票适配器默认不复权，趋势功能明确传 `adjust=forward`，指数无复权参数 |
+| 短线竞价风向标（手动补充） | `/api/a-share/auction/short-term-benchmark` | 显式date；响应date/date_ms精确核对，timestamp为组装时间；仅官方样本 |
+| 龙虎榜（手动补充） | `/api/a-share/special-data/dragon-tiger-list` | 显式date、board_type=all/org/hot_money；一年内交易日，全量不分页；区分1日/3日及榜单范围 |
 
 `HiThinkProvider` 的公开方法为 `get`、`calendar`、`pool`、`auction`、`market`、`catalog`、`indices`、`members`、`ladder`、`tickers`、`historical` 和 `index_historical`。`get` 返回已校验信封内的 `data`，业务失败抛出 `APIError`。应用通过同一个适配器执行数据访问，便于替换数据源。
 
@@ -48,9 +52,11 @@
 
 实时采集应当每收到一批就调用引擎、更新排名并持久化。一次请求最多100只。全市场循环时，各批时间不同；候选集、单批耗时、实际覆盖率、轮询周期及终态标志必须保留给用户。官方文档没有承诺延迟 SLA，无法对上游数据尚未就绪时的09:25结果完整性作无条件保证。
 
-常规接口对网络错误、HTTP 429/部分5xx、业务4001/5001/5002/5003最多额外重试3次，指数退避0.5、1、2秒，HTTP `Retry-After` 支持秒数及日期，单次退避最多15秒。常规默认超时6秒。1xxx/2xxx、3002等不进行内部盲重试。
+常规接口对网络错误、HTTP 429/部分5xx、业务4001/5001/5002/5003最多额外重试3次，基础指数退避0.5、1、2秒。兼容`Retry-After`的秒数及HTTP日期格式；如果要求等待超过15秒，不把它截短为15秒再立即重试，而返回受控错误供调用方以后处理。常规默认超时6秒。1xxx/2xxx、3002等不进行内部盲重试。
 
 **竞价请求不进行内部重试**，每批只有一次带超时的请求；下一轮及有限终态补采窗口由调度器负责，避免一次限流拖慢所有后续股票。所有相同 Key 的客户端实例共享最小请求间隔，默认0.5秒。复盘是后台工作，竞价窗口不应同时启动大量复盘请求。
+
+1.4另外在同一进程的同Key实例之间共享HTTP429/业务4001冷却；冷却中不发新的上游请求，公开状态显示剩余等待。官网现述“当前不限制累计调用次数”，同时明确会根据负载动态限流，不能推导出无限并发或稳定QPS。Retry-After解析属于本机工程兼容；官网没有承诺一定返回该头，也没有据此给出竞价延迟SLA。
 
 ## 收盘复盘口径
 
@@ -146,3 +152,27 @@ Markdown 保留原始快照日期、有效交易日期、推断/核实标记、�
 | [MDN download](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/a#download)说明浏览器下载行为依设置而异 | 点击保存先写本机文件，再提供同源下载和路径提示 | 不以出现下载框作为唯一保存成功条件。 |
 
 以上属于依据官方契约作出的产品与工程选择，不是新增收益因子、策略回测或实盘效果证明。
+
+## 1.4 官网完整指南的使用范围
+
+`sentiment.py`不引入新来源：梯队矩阵复用已保存的`raw.calendar/raw.pools_by_date`，封单和原因分布复用完整当期涨停池。使用`limit_up_reason`原文，不调用只支持当日的个股异动接口来填历史原因，不使用当前成分表作历史归因。空池、缺失、重复代码、日期错误分别处理；统计公式见策略文档。
+
+`official_context.py`在用户主动补充时最多调用4个业务分项：风向标一次、龙虎榜三类各一次；全部显式传目标报告的date。每个provider.get仍可能常规重试，不能把4个分项写成总共4次HTTP请求。自动复盘不发这四项，也不因此扫描额外年份、概念成员或每只股票日线。
+
+| 官方契约 | 系统使用与边界 |
+| --- | --- |
+| [集合竞价及短线风向标](https://fuyao.aicubes.cn/docs/api-reference/auction/)：基准响应含date、date_ms、timestamp、item | date须等于报告日，date_ms须等于该日上海零点；timestamp只作组装时间。auction_pct是百分数原值，tags是解释标签。样本数量与有效涨幅数分列，统计不是全市场。 |
+| [龙虎榜](https://fuyao.aicubes.cn/docs/api-reference/dragon-tiger-data/)：显式date限一年内交易日，三种board_type全量返回 | 非交易日1002，未来或超过一年1003，不默认换成最近日。all/org读取stock_items，hot_money读取hot_money_items[].rows。count是上游记录数，stock_count是上游去重股票数；游资展开条数、展开股票数另列，不能直接用上游数作其完整性分母。 |
+| 龙虎榜金额、比例与区间 | net_value、机构及游资净额均为元；change、net_rate等原小数×100后另存_pct。range_days=1/3分组，其他值单列，重复记录不汇总；三榜存在重叠，不相加。 |
+| [主力资金](https://fuyao.aicubes.cn/docs/api-reference/capital-flow/)仍未开放外部接入 | 不调用capital-flow路径。龙虎榜是特定上榜记录，不是全市场股票或板块主力资金流；原板块成交参与度仍独立保留。 |
+| [涨停、跌停、炸板及天梯](https://fuyao.aicubes.cn/docs/api-reference/limit-up-data/) | 用严格完整分页的涨停池统计；limit_break端点已存在。天梯无日期参数且每板最多4只，不冒充全市场完整矩阵。 |
+
+龙虎榜字段表规定timestamp应为目标日上海零点，但2026-09-20获取的官方REST及MCP示例存在内部矛盾：示例trade_date为2026-07-01，timestamp为1782921600000（上海2026-07-02零点）；7月1日零点应是1782835200000。程序按明确trade_date核对请求日，另输出`timestamp_matches_date`；矛盾或缺失时分项partial，保留原始时间并说明，既不抄示例数值，也不静默改写日期。该记录是文档示例检查，不是对真实账户接口的验收结论。
+
+官网最佳实践是可修改的研究示例：
+
+- [04 涨停池与连板天梯](https://fuyao.aicubes.cn/best-practices/04-limit-up-market/example.html)提供展示思路，但原始continue_day_cnt仍不能把5天4板解释成4连板，非交易日空结果不能替代所选交易日证据。
+- [12 涨停情绪](https://fuyao.aicubes.cn/best-practices/12-limitup-sentiment-timing/example.html)的“接口不提供炸板池”与当前REST全文冲突，属于过时描述。系统保留现有炸板接口；原因原文不改成行业，天梯有限样本不作全市场晋级分母。
+- [16 龙虎榜拓扑](https://fuyao.aicubes.cn/best-practices/16-dragon-tiger-capital-flow/example.html)强调默认只纳入range_days=1防1/3日重复，多概念等分是研究归因。本版分别显示区间并保留重复提示，不计算概念资金合计，不复制示例模拟数据。
+
+原始响应data保存在报告`official_context.raw`，网页和AI摘要不含raw；JSON导出供核查。Markdown保留日期、样本、区间及质量说明。补充形成新报告版本使旧AI附录过期；行情原报告status与补充分项status分开，不能用一部分新增数据掩盖原有缺失。研究缓存位于ignored `work/official-2026-09-20/llms-full.txt`，不随程序运行加载。

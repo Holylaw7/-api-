@@ -71,7 +71,7 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         try:
             if path == '/api/health':
-                self._json({'ok':True,'application':'auction-lab','version':'1.3.0'})
+                self._json({'ok':True,'application':'auction-lab','version':'1.4.0'})
             elif path == '/api/state':
                 self._json(service.snapshot())
             elif path == '/api/events':
@@ -190,6 +190,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/reports/load':
                 service.load_report(body.get('date'))
                 message = '已读取本机历史报告，未重新请求行情'
+            elif path == '/api/reports/enrich':
+                started = service.enrich_report(body.get('date'), body.get('review_id'))
+                message = '正在补充所选日期的官方观察' if started else '已有官方观察任务，请等待完成'
             elif path == '/api/reports/save':
                 saved = service.markdown_report(body.get('date'), body.get('include_ai',False), body.get('provider'),
                     body.get('review_id'), body.get('baseline'), save=True)

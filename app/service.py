@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import re
 import threading
 import time
@@ -16,6 +17,8 @@ from .selection import build_trend_pool
 from .report_library import ReportLibrary, valid_date
 from .reporting import report_identity
 from .insights import compare_reports, readiness
+from .sentiment import build_sentiment
+from .official_context import build_official_context
 
 SH = timezone(timedelta(hours=8), name='Asia/Shanghai')
 
@@ -53,6 +56,8 @@ class Service:
         self.status = 'idle'
         self.message = '请配置数据 Key；随后自动等待交易日竞价及收盘复盘'
         self.provider = None
+        self._sentiment_source = None
+        self._sentiment_value = None
         self.days = []
         self.prepared_date = None
         self.calendar_loaded_date = None
@@ -200,7 +205,8 @@ class Service:
                                                      sources=self.sources.get(c,['manual']), tracking=self.mode == 'live' and self.running and c in self.codes)
                                                 for c in self.config['watchlist']],
                                      trend_pool=self._public_report(self.trend_pool) if self.mode == 'live' else {}),
-                         review=self._public_report(self.review), review_id=self._review_identity(), jobs=self.jobs, config=self.config,
+                         review=self._public_report(self.review), review_id=self._review_identity(),
+                         review_sentiment=self._review_sentiment(), api=self._api_status(), jobs=self.jobs, config=self.config,
                          llm=dict(**ai_state, configured=active['configured'], base_url=active['base_url'],
                                   model=active['model'], label=active['label'],
                                   result=self.llm_results.get(active['id']),
@@ -226,6 +232,87 @@ class Service:
             self._identity_source = self.review
             self._identity_value = report_identity(self.review) if self.review else None
         return self._identity_value
+
+    def _review_sentiment(self):
+        # Old reports gain a local view without rewriting evidence or AI identity.
+        if self._sentiment_source is not self.review:
+            self._sentiment_source = self.review
+            self._sentiment_value = (self.review.get('sentiment') or build_sentiment(self.review)) if self.review else None
+        return self._sentiment_value
+
+    def _api_status(self):
+        status = {'rate_limited':False, 'cooldown_seconds':0}
+        if self.mode == 'live' and self.provider is not None and hasattr(self.provider, 'rate_limit_status'):
+            status = self.provider.rate_limit_status()
+        remaining = max(0, self.api_backoff_until - time.monotonic()) if self.mode == 'live' else 0
+        seconds = max(remaining, status.get('cooldown_seconds', 0))
+        return {'rate_limited':seconds > 0, 'cooldown_seconds':round(seconds, 1)}
+
+    def enrich_report(self, date, review_id):
+        """Explicit bounded official observations; never part of auction polling."""
+        valid_date(date)
+        current = now_sh()
+        with self.lock:
+            if self.mode != 'live':
+                raise ValueError('演示中不能联网补充真实报告')
+            if self._auction_priority():
+                raise ValueError('09:10–09:26 优先竞价，请稍后补充官方观察')
+            if self.jobs.get('review', {}).get('status') == 'running':
+                raise ValueError('请等待复盘生成完成后补充官方观察')
+            if self.jobs.get('evidence', {}).get('status') == 'running':
+                return False
+            if date > current.date().isoformat() or (date == current.date().isoformat() and current.hour < 15):
+                raise ValueError('只能补充已收盘交易日的报告')
+            report = self.saved_report(date)
+            captured_id = report_identity(report)
+            if not isinstance(review_id, str) or review_id != captured_id:
+                raise ValueError('报告已经更新，请刷新后再补充官方观察')
+            calendar = (report.get('raw') or {}).get('calendar')
+            if not isinstance(calendar, list) or date not in calendar:
+                raise ValueError('该报告缺少交易日历证据，请先重新生成复盘')
+            generation = self.demo_generation
+
+        def cancelled():
+            return (self.shutdown.is_set() or generation != self.demo_generation
+                    or self.mode != 'live' or self._auction_priority())
+
+        def work():
+            self._progress('evidence', '读取短线竞价基准和三类龙虎榜；不改动竞价评分')
+            context = build_official_context(self._provider(), date, should_stop=cancelled)
+            if cancelled() or context.get('cancelled'):
+                raise ValueError('官方观察已中断，原报告保留；可在竞价保护时段外重试')
+            if context.get('status') == 'unavailable':
+                raise ValueError('官方观察暂无可用数据，原报告保留；请稍后重试或检查接口权限')
+            if (report.get('official_context') or {}).get('status') == 'ready' and context.get('status') != 'ready':
+                raise ValueError('本次官方观察不完整，已保留上一份完整结果')
+            updated = copy.deepcopy(report)
+            updated['official_context'] = context
+            updated['sentiment'] = build_sentiment(updated)
+            updated['enriched_at'] = now_sh().isoformat()
+            # Validate rendering before committing evidence; an export file can
+            # still be locked on Windows, so its later IO failure is separate.
+            self.report_library.markdown(updated)
+            with self.lock:
+                if cancelled():
+                    raise ValueError('模式或采集时段已改变，原报告保留')
+                stored = self.report_library.get(date, 'live')
+                if report_identity(stored) != captured_id:
+                    raise ValueError('报告在补充期间已更新，未覆盖新版本，请重试')
+                atomic_json(self.data_dir / 'reports' / (date+'.json'), updated)
+                self.store.report(date, 'live', updated)
+                if self.latest_review and self.latest_review.get('date') == date:
+                    self.latest_review = updated
+                if self.review and report_identity(self.review) == captured_id:
+                    self.review = updated
+                    self.llm_results.clear()
+                    self.llm_result = None
+                try:
+                    self._save_markdown(updated)
+                except OSError:
+                    raise ValueError('官方观察已保存且报告版本已更新，但 Markdown 文件写入失败；请关闭占用文件后点击保存 Markdown 重试') from None
+            self.touch()
+
+        return self._job('evidence', work)
 
     def report_catalog(self):
         with self.lock:
@@ -328,6 +415,9 @@ class Service:
 
     def _job(self, name, func):
         with self.lock:
+            peer = {'review':'evidence', 'evidence':'review'}.get(name)
+            if peer and self.jobs.get(peer, {}).get('status') == 'running':
+                raise ValueError('复盘生成与官方观察补充正在使用同一报告，请等待当前任务完成')
             if self.jobs.get(name, {}).get('status') == 'running':
                 return False
             self.jobs[name] = dict(status='running', message='处理中')
@@ -651,13 +741,17 @@ class Service:
             except Exception as exc:
                 safe = str(exc) if isinstance(exc,ValueError) or exc.__class__.__name__ == 'APIError' else type(exc).__name__+'：批次请求失败'
                 self.error(safe)
-                if getattr(exc, 'code', None) in (2001,2003,4001,429):
+                requested_wait = getattr(exc, 'retry_after_seconds', None)
+                requested_wait = requested_wait if isinstance(requested_wait, (int, float)) and not isinstance(requested_wait, bool) and math.isfinite(requested_wait) and requested_wait >= 0 else 0
+                if getattr(exc, 'code', None) in (2001,2003,4001,429) or requested_wait > 0:
                     # Do not hammer an invalid credential or a rate-limited service.
                     if getattr(exc,'code',None) in (2001,2003):
                         self.stop()
                     else:
-                        self.api_backoff_seconds = min(60, max(3, self.api_backoff_seconds*2))
+                        self.api_backoff_seconds = max(min(60, max(3, self.api_backoff_seconds*2)), requested_wait)
                         self.api_backoff_until = time.monotonic()+self.api_backoff_seconds
+                        with self.lock:
+                            self.message = f'接口暂缓请求，等待约 {self.api_backoff_seconds:.0f} 秒后再采集；已有排名与缺失标记保留'
                     break
                 continue
             data = dict(data, _requested_codes=batch)
@@ -688,6 +782,8 @@ class Service:
             valid_date(date)
         if self.mode == 'demo':
             raise ValueError('当前为演示模式。请启动实盘服务后再生成真实复盘')
+        if self.jobs.get('evidence', {}).get('status') == 'running':
+            raise ValueError('请等待官方观察补充完成后重新生成复盘')
         current = now_sh()
         if date is not None and date > current.date().isoformat():
             raise ValueError('请选择已收盘的交易日')
@@ -705,6 +801,7 @@ class Service:
             report = build_review(provider, chosen, previous, progress=lambda s:self._progress('review',s))
             report['mode'] = 'live'
             report['config_weights'] = dict(self.config['weights'])
+            report['sentiment'] = build_sentiment(report)
             self.store.report(chosen, 'live', report)
             atomic_json(self.data_dir / 'reports' / (chosen+'.json'), report)
             self._save_markdown(report)
@@ -739,6 +836,7 @@ class Service:
                 raise ValueError('报告已经更新，请刷新页面后再生成 AI 分析')
             # A daily report appendix must not mix today's auction with an older report.
             state = {'mode':report.get('mode','live'), 'now':state['now'], 'review':self._public_report(report),
+                     'review_sentiment':report.get('sentiment') or build_sentiment(report),
                      'auction':{'date':None,'phase':'not_included','summary':{},'rows':[]},
                      'stocks':{'analysis':None}}
             scope = 'review'
@@ -886,7 +984,8 @@ class Service:
                 if current > boundary+timedelta(seconds=self.config['final_grace_seconds']) and not self.finalized:
                     with self.lock:
                         self.message = f'竞价窗口已结束。已收集 {len(self.processed)}/{len(self.codes)} 只，终态 {len(self.final_codes)}/{len(self.codes)}；缺失数据未补造'
-                if self.config['auto_review'] and current.strftime('%H:%M') >= self.config['review_time'] and self.last_review_attempt != today:
+                if (self.config['auto_review'] and current.strftime('%H:%M') >= self.config['review_time']
+                        and self.last_review_attempt != today and self.jobs.get('evidence', {}).get('status') != 'running'):
                     self.last_review_attempt = today
                     if not self.latest_review or self.latest_review.get('date') != today or self.latest_review.get('status') != 'ready':
                         self.run_review(today, automatic=True)

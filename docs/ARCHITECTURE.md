@@ -1,6 +1,6 @@
 # 架构与二次开发
 
-版本1.3。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。
+版本1.4。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`，新增用户流程见 `docs/OFFICIAL_UPGRADE.md`。
 
 ## 模块与数据流
 
@@ -18,6 +18,8 @@ stocks.py → 单股日线研究 → stocks/个股日期.json
 selection.py → 有限候选趋势筛选 → trend-pool.json → 下一会话重点池
 report_library.py ↔ storage.py / 报告JSON → reporting.py → Markdown保存与下载
 insights.py → 两期报告比较 / 本机就绪检查（不请求行情）
+sentiment.py → 留存完整池的情绪结构（不请求行情）
+official_context.py → 手动、显式日期的风向标 / 龙虎榜 → 新版本报告
 ```
 
 全项目 Python 标准库，前端原生 HTML/CSS/JS，无第三方 CDN。Windows 使用固定 UTC+08:00（Asia/Shanghai 现代交易时区），不依赖系统时区数据库。所有入库时间包含偏移。
@@ -73,6 +75,7 @@ insights.py → 两期报告比较 / 本机就绪检查（不请求行情）
 | POST `/api/review` | `{"date":"YYYY-MM-DD"}`，日期可省略 |
 | POST `/api/reports/load` | `{"date":"YYYY-MM-DD"}`，读取实盘历史视图 |
 | POST `/api/reports/save` | `{date?,include_ai?,provider?,review_id?,baseline?}`，原子保存并返回带SHA-256的下载地址 |
+| POST `/api/reports/enrich` | `{date,review_id}`，后台读取该日风向标与三类龙虎榜；需要已有真实报告及原始日历，保护时段禁用 |
 | POST `/api/demo` | 显式进入合成演示 |
 | POST `/api/config` | 合并并校验非敏感配置 |
 | POST `/api/watchlist/add` | `{"codes":["000001","600519.SH"]}`；也支持分隔文本；1–50只，保护时段每次1只；异步官方核验 |
@@ -85,7 +88,7 @@ insights.py → 两期报告比较 / 本机就绪检查（不请求行情）
 
 所有 POST 要求同源及 `X-Local-App: auction-lab`；请求 Host 必须是本机服务地址，降低跨站和 DNS 重绑定风险。GET 不回显凭据。静态文件是白名单，不能下载 SQLite、Python 源码或凭据。远程 LLM 强制 HTTPS，重定向禁止转发 Key。
 
-复盘、添加自选、个股分析、趋势刷新、AI生成和AI连接测试响应含 `{ok,message,started}`。`started=false` 表示同名任务已在运行，并非又启动一个任务。`jobs` 的键包括 `prepare/review/llm/llm_test/stock/watchlist/trends`，每个值为 `{status:'running'|'done'|'error',message}`。保护时段个股任务可能已经 `done`，但 `stocks.analysis.status='deferred'`，表示日线在等待09:27，不应当显示计算成功或零分。
+复盘、补充官方观察、添加自选、个股分析、趋势刷新、AI生成和AI连接测试响应含 `{ok,message,started}`。`started=false` 表示同名任务已在运行，并非又启动一个任务。`jobs` 的键包括 `prepare/review/evidence/llm/llm_test/stock/watchlist/trends`，每个值为 `{status:'running'|'done'|'error',message}`。保护时段个股任务可能已经 `done`，但 `stocks.analysis.status='deferred'`，表示日线在等待09:27，不应当显示计算成功或零分。
 
 新增公开状态为：
 
@@ -159,6 +162,24 @@ Service分开维护`review`、`latest_review`和`viewing_archive`。前者只代
 `readiness(snapshot,internal)`只使用本地公开状态及prepared_date/calendar_loaded_date。时点由snapshot.now提供，日历必须今日核验；休市不要求本日终态。竞价活动时检查监测、关注池、接收年龄和覆盖，收尾后缺终态仅提示；自选模式不要求趋势池；未知mode明确错误。返回诊断是本机已知状态，不代表远程接口鉴权、上游时效或整段竞价已成功验证。
 
 接入新数据源后至少用一个真实交易日验收：09:05前启动、09:10前完成准备；09:15检查首批；09:20检查阶段；09:25检查现有排名和终态覆盖；保存一轮耗时/每股覆盖；15:10检查日期与完整池。模拟回放只能证明程序顺序与算法边界，不能证明线上时延。
+
+## 情绪结构、官方观察与请求可靠性（1.4）
+
+`sentiment.py`使用报告的`raw.pools_by_date/raw.calendar`和当期涨停行，纯计算至多10日完整池梯队、封单留存分布、原因原文分组。`Service._review_sentiment()`按报告对象缓存；旧报告通过独立的`state.review_sentiment`展示，不为新增视图重写SQLite/JSON或改变AI证据身份。新`run_review`结果持久化`sentiment`。Markdown在旧报告缺字段时同样纯计算补视图，不发网络请求。
+
+`Service.enrich_report(date,review_id)`是用户主动触发的`evidence`后台任务。提交时验证真实模式、已收盘、原报告日历及指纹；拒绝复盘正在生成和09:10–09:26。`official_context.py`只执行四个固定业务分项：竞价风向标，以及同日all/org/hot_money龙虎榜。每次provider.get之前检查取消；provider常规重试保留，因此HTTP尝试数可能超过四次。自动复盘、SSE、浏览历史、保存报告、AI分析均不会隐式启动这四项。
+
+补充模块逐项保存原始data和受控错误，公开输出使用字段白名单；不读取成员表，不把龙虎榜归因为板块主力净流。风向标日期和date_ms必须完全吻合；龙虎榜trade_date核对且另检查零点timestamp，矛盾明确partial。失败分项为null，成功空榜为有效空数组；同股多区间和多记录保留，不猜测去重金额。各榜、各区间分别截取最多30行，raw保留完整结果。
+
+任务完成后深拷贝原报告，添加`official_context/sentiment/enriched_at`，先预检Markdown渲染，再检查模式、保护时段及已存报告指纹；随后写JSON、SQLite，替换仍匹配的当前视图及latest_review、清除旧AI，最后写Markdown。Markdown文件写入失败时新证据和版本仍已同步，错误提示用户关闭占用文件后直接重试本机保存，不再次取数。各文件的原子替换不等于JSON、SQLite、Markdown整体原子事务。取消、全部不可用、并发报告更新或已有ready补充将被partial覆盖时，原报告保留。原有行情`report.status`与`official_context.status`独立，补充成功不升级旧盘面完整性。新证据改变`review_id`，原AI结果不沿用；历史视图与latest_review继续各司其职。
+
+主程序和独立助手依然通过`llm.build_summary`输出同一递归白名单。新增`sentiment/official_observations`保留日期、样本、区间和缺失口径；龙虎榜每榜每区间进一步截取10条，不能称为完整名单。模型不接收raw、配置和未知上游字段。报告专属AI仍不混入今天竞价；DeepSeek、OpenAI和custom的配置、在途请求及结果隔离继续有效。
+
+`provider.pool`验证分页回显page/size、total/pages算术一致性、页间总数稳定性、每页应有数量及代码唯一性；空池允许总页数0或1。全市场价格按目录总量翻页，不能把某页有效行情为空当作完成；证券目录也检查跨页重复。接口变动或部分缺页应失败，不能静默缩成完整样本。
+
+限流采用同进程同Key共享冷却：HTTP429或业务4001记录下一可尝试时点，后续请求在冷却中快速返回受控错误，已有状态和SSE继续。Service另把已知冷却计入竞价调度，公开`api.rate_limited/cooldown_seconds`供页面显示。常规错误仍有有界重试；解析Retry-After是HTTP工程兼容，不是官网承诺。超过15秒的等待不会被截短成15秒再马上重试，而由调用方以后处理。竞价本身仍禁内部重试，冷却不改变逐批落盘、评分和发布顺序。
+
+本轮复用入口是`sentiment.build_sentiment`与`official_context.build_official_context`，后者要求兼容`HiThinkProvider.get`且已校验HTTP200/code0的数据适配器。增改字段要同步CONTRACT、Markdown、页面、LLM白名单与临时夹具测试；官方参考资料位于ignored work目录，不能成为程序启动依赖。
 
 ## 独立 AI 应用（1.2）
 

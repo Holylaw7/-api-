@@ -1,4 +1,4 @@
-# 模块与接口契约 · 1.3
+# 模块与接口契约 · 1.4
 
 Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UTC+08。共享可变状态由service锁保护；密钥不进入状态、文档或测试。字段缺失保留null，调用失败与成功空列表区分。
 
@@ -18,6 +18,8 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 | `reporting.py` | `report_identity(report)->str` 稳定公开证据 SHA-256；`render_markdown(report,ai=None,comparison=None)->str` 纯计算、安全转义的 Markdown |
 | `report_library.py` | `ReportLibrary(store,data_dir)`；`list/get/markdown/save/read_markdown/save_ai/load_ai`，本机报告读取、原子保存和模式隔离，不调用行情接口 |
 | `insights.py` | `compare_reports(current,previous)->dict` 两期证据比较；`readiness(snapshot,internal=None)->dict` 本机状态诊断，均无网络或磁盘 I/O、不读取系统时钟 |
+| `sentiment.py` | `build_sentiment(report)->dict` 从留存完整池计算至多10日梯队矩阵、封单留存与原因原文分布；纯计算，无外部请求 |
+| `official_context.py` | `build_official_context(provider,date,should_stop=None)->dict` 显式日期的风向标与三类龙虎榜，最多4个业务分项；分项失败隔离、原始data保存在raw |
 
 `review._price_trend`是stocks与selection共用的日线指标原语，但两模块的综合评分公式不同；不要因同名`_trend_score`而合并。竞价七因子又是独立公式，三种分数不可混排。
 
@@ -33,7 +35,7 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 
 ## HTTP
 
-GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: version`、`event: state`加JSON，重连建议为2000毫秒。状态版本变化立即推送完整状态，不等待固定刷新周期；闲时每次最长等待3秒后可发送注释keepalive，完整状态一般15秒刷新一次，09:10–09:26保护时段改为3秒，以更新时钟和陈旧提示。这是页面刷新策略，不改变竞价逐批计算或上游请求频率。GET `/api/history?symbol=完整代码`读取已有本机观察；GET `/api/health`主服务版本为1.3.0。
+GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: version`、`event: state`加JSON，重连建议为2000毫秒。状态版本变化立即推送完整状态，不等待固定刷新周期；闲时每次最长等待3秒后可发送注释keepalive，完整状态一般15秒刷新一次，09:10–09:26保护时段改为3秒，以更新时钟和陈旧提示。这是页面刷新策略，不改变竞价逐批计算或上游请求频率。GET `/api/history?symbol=完整代码`读取已有本机观察；GET `/api/health`主服务版本为1.4.0。
 
 | POST路径 | JSON请求体及作用 |
 | --- | --- |
@@ -41,6 +43,7 @@ GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: 
 | `/api/review` | `{date?:'YYYY-MM-DD'}`，只接受已收盘交易日 |
 | `/api/reports/load` | `{date:'YYYY-MM-DD'}`；读取本机实盘历史报告，禁止演示中读取或复盘生成过程中切换，不请求行情 |
 | `/api/reports/save` | `{date?,include_ai?:false,provider?,review_id?,baseline?}`；原子保存Markdown，include_ai必须为JSON布尔值；返回文件信息及校验下载地址 |
+| `/api/reports/enrich` | `{date:'YYYY-MM-DD',review_id:'当前证据SHA-256'}`；异步补充指定已保存真实报告的官方观察；详见1.4契约 |
 | `/api/demo` | `{}`，显式合成演示；与真实数据隔离 |
 | `/api/config` | 非敏感配置变更；调整范围/权重须先停止。新增自选走核验端点 |
 | `/api/watchlist/add` | `{codes:['000001','600519.SH']}`；也支持分隔字符串；1–50只，保护时段1只；异步核验并保存 |
@@ -53,7 +56,7 @@ GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: 
 | `/api/llm-test` | `{provider?}`；后台GET模型列表检查，返回started |
 | `/api/llm` | `{question?:'...',provider?,review_date?,review_id?}`；无review_date为盘面分析，有review_date为该版本收盘报告专属分析，详见下文 |
 
-响应为`{ok,message,...}`；review、watchlist/add、stocks/analyze、trends/refresh、llm及llm-test另含started，false表示同名任务正在运行。仅允许本机Host、同源及`X-Local-App: auction-lab`。禁止GET暴露密钥、任意文件读取或向不同服务转发旧密钥。股票代码必须是字符串，保留前导零；裸代码不能仅凭已有完整代码缓存假定唯一。
+响应为`{ok,message,...}`；review、reports/enrich、watchlist/add、stocks/analyze、trends/refresh、llm及llm-test另含started，false表示同名任务正在运行。仅允许本机Host、同源及`X-Local-App: auction-lab`。禁止GET暴露密钥、任意文件读取或向不同服务转发旧密钥。股票代码必须是字符串，保留前导零；裸代码不能仅凭已有完整代码缓存假定唯一。
 
 | GET路径 | 查询参数与返回 |
 | --- | --- |
@@ -74,12 +77,13 @@ state = {
  auction:{date,phase,rows,summary,universe_count,processed_count,
           cycle_seconds,last_batch_ms,finalized,final_count,coverage,source_counts},
  stocks:{query_code,analysis,watchlist,trend_pool},
- review:null|report, review_id:null|sha256, jobs:{}, config:publicConfig,
+ review:null|report, review_id:null|sha256, review_sentiment:null|sentiment,
+ api:{rate_limited:boolean,cooldown_seconds:number}, jobs:{}, config:publicConfig,
  llm:{active_provider,profiles,configured,base_url,model,label,result,connection_test},errors:[]
 }
 ```
 
-公开calendar.dates只显示最近15个交易日，不能当作筛选/均线所需完整日历。jobs以prepare/review/llm/llm_test/stock/watchlist/trends为键，值为`{status:'running'|'done'|'error',message}`。job完成不代表日线已生成：保护时段analysis.status可以为deferred。
+公开calendar.dates只显示最近15个交易日，不能当作筛选/均线所需完整日历。jobs以prepare/review/evidence/llm/llm_test/stock/watchlist/trends为键，值为`{status:'running'|'done'|'error',message}`。job完成不代表日线已生成：保护时段analysis.status可以为deferred。api冷却为本机已知的剩余等待，不代表外部服务保证恢复时间。
 
 竞价rows含`rank,thscode,name,score,factors,quality,auction_pct,auction_amount,updated_at,phase,sources`；公开状态去掉raw和大体积历史，详细本机轨迹另取。
 
@@ -117,6 +121,67 @@ comparison = {
 指标行status为ready/provisional/unavailable；数量为家或板、成交额为元、比例差为百分点。板块rank_change=基准名次−当期名次，正值表示样本内名次前进，不能解释为净资金。先按完整代码匹配全部共同板块，再展示涨幅变化绝对值前30项。涨停池必须ready、数量相符、无重复且完整代码有效，才能判共同两期涨停/当期新出现/从对比池退出；空完整池为0，失败池为null。相邻性只从当期raw.calendar核验，不凭自然日差推断；即使共同两期出现也不自行推定中间连续涨停。严格连板只用consecutive_days并保留下限。日期不对应不计算变化，推断日期或不完整盘面标provisional。成交额基准为0时相对变化为空。
 
 诊断时点来自snapshot.now，内部只补prepared_date/calendar_loaded_date。交易日历必须今日核验且成员与today_is_trading一致；不以周末或工作日替代官方日历。竞价时段检查关注池、监测开关、本地接收年龄和覆盖；收尾后缺终态为warn，休市日不要求终态。仅自选模式趋势池为info；未知mode直接error。结果是已知状态检查，不证明远程鉴权成功、未来可用性或十分钟完整覆盖。
+
+## 情绪结构与官方补充观察（1.4）
+
+`review_sentiment`为当前报告的本机纯统计视图，优先复用报告已有`sentiment`，旧报告则按不可变报告对象缓存计算。浏览旧报告不写库、不请求金融接口、不改变`review_id`；新生成报告会持久化`sentiment`。统计结果结构：
+
+```text
+sentiment = {
+ version:'1.0',date,mode,status,definition,warnings,
+ matrix:{status,rows:[{date,status,limit_up_count,buckets:{1,2,3,4,5+,unknown},
+   lower_bound_count,lower_bound_by_bucket,max_consecutive,coverage,warnings}],
+   coverage:{expected_days,complete_days,coverage_pct,calendar_verified,requested_window_days:10},
+   definition,warnings},
+ retention:{status,total_count,observed_count,valid_count,missing_count,invalid_count,
+   above_100_count,excluded_conflict_count,median_pct,below_50_count,below_50_pct,
+   coverage_pct,definition,warnings},
+ reasons:{status,source_field:'limit_up_reason',total_count,observed_count,known_count,
+   missing_count,invalid_count,excluded_conflict_count,group_count,displayed_count,coverage_pct,
+   rows:[{reason,count,share_pct,codes,displayed_code_count,other_code_count}],definition,warnings}
+}
+```
+
+矩阵至多10个目标日前交易日，完整池缺失或代码重复/无效时计数为null。`buckets`是字符串键且互斥；无法确认的高度单列unknown，窗口下限另计，1板下限不等于首板。封单分布剔除当前封单额大于峰值的异常；`above_100_count`独立于其他数值异常计数。原因保留完整原文，最多12组、每组最多10个代码，不解释为行业。
+
+`POST /api/reports/enrich`只允许live、非未来且已收盘、具备`raw.calendar`中目标日证据的已保存报告；报告版本必须匹配，09:10–09:26与复盘生成期间拒绝开始。返回`{ok,message,started}`，任务为`jobs.evidence`。按顺序读取显式`date`的风向标和`board_type=all/org/hot_money`三榜，每次新分项请求前检查模式、关闭和保护时段。`requests.attempted`统计业务分项调用，**不是HTTP尝试数**；provider可以按现有策略重试，最多4个分项不等于总共4次HTTP请求。
+
+```text
+official_context = {
+ date,mode:'live',generated_at,status:'ready'|'partial'|'unavailable'|'cancelled',
+ cancelled,requests:{attempted,max:4},definition,warnings,
+ errors:[{section,kind,code,message}],raw:{benchmark?,all?,org?,hot_money?},
+ benchmark:null|{status,date,date_ms,response_timestamp,endpoint,sample_count,
+   valid_auction_count,mean_auction_pct,median_auction_pct,positive_ratio_pct,
+   rows:[{thscode,ticker,name,auction_pct,tags,record_index}],shown_count,truncated,sort,definition,warnings},
+ dragon_tiger:{all:null|board,org:null|board,hot_money:null|board}
+}
+board = {
+ status,board_type,trade_date,timestamp,timestamp_matches_date:true|false|null,
+ date_basis:'explicit_trade_date',endpoint,reported_count,reported_stock_count,
+ received_rows,observed_stock_count,groups:{one_day:[row],three_day:[row],other:[row]},
+ group_counts:{one_day,three_day,other},shown_count,truncated,duplicate_record_count,
+ actors:[{name,reported_net_value,row_count}],actor_count,actors_truncated,sort,definition,warnings,
+ coverage:{status:'verified'|'inconsistent'|'unknown',scope,
+   record_count_matches:true|false|null,stock_count_matches:true|false|null,definition}
+}
+```
+
+风向标验证`date`与上海零点`date_ms`完全一致；timestamp只表示组装时间。均值、中位数、上涨占比仅统计有效竞价涨幅，真实0保留，`auction_pct`本身已经是百分数。样本缺失则统计null；重复代码使该分项不可用。公共行按涨幅降序、代码升序最多30只，完整数据留raw。
+
+龙虎榜核对`trade_date`和`board_type`，timestamp与该日零点交叉检查；不一致或缺失使分项partial，但保留明确trade_date来源，原始时间不改写。`count`是上游记录数，`stock_count`是去重股票数，不能互相替代。每区间最多30行，截取前数量在`group_counts`；全部榜按`net_value`、机构榜按`org_net_value`、游资榜按`hot_money_item_net_value`降序，缺值末尾，同值按代码/游资名称/原序号稳定排序。
+
+all/org的coverage按`scope='stock_items'`核对声明总条数与实际行数、声明去重股票数与有效代码去重数；不符则inconsistent并使分项partial，不能声称完整空榜。hot_money的coverage为`scope='hot_money_items.rows',status='unknown'`，两个matches均null：上游计数与游资展开样本范围不同，两者差异本身不作为丢数据证据；游资分项ready也不表示已证明全量覆盖。
+
+`row`采用白名单：`thscode,ticker,name,range_days,limit_reason,concept_list`，其中limit_reason是涨跌停原因；金额元字段`net_value,org_net_value,hot_money_net_value,hot_money_item_net_value,buy_value,sell_value,amount`；原小数字段`change,net_rate,org_net_rate,hot_money_net_rate,hot_money_item_net_rate`及相应`change_pct,net_rate_pct,org_net_rate_pct,hot_money_net_rate_pct,hot_money_item_net_rate_pct`百分数字段；`hot_rank,org_buy_num,org_sell_num,hot_money_name,reported_hot_money_net_value,record_index,duplicate_record,quality`。游资从`hot_money_items[].rows`展开，上层`buying`保存为聚合净额，不能按子行再次累加。同股票同区间多记录保留并标注；不计算三榜、不同区间或概念金额合计。
+
+取消、全部不可用或持久化前版本冲突时原报告保留；原有ready补充不被新partial替换。可用补充通过完整报告深拷贝写入`official_context`、`sentiment`、`enriched_at`，不改变原复盘`status`。更新的是报告版本，不是盘前选股或竞价排名；旧AI附录随review_id变化失效。自动复盘只生成本机情绪结构，不调用这四个补充分项。
+
+提交前预检Markdown渲染；保存证据并同步内存版本、清除旧AI后才写Markdown文件。文件被占用等写入失败不回滚已保存证据，会提示可直接重试本机导出；不能声称JSON、SQLite、Markdown整体构成原子事务。
+
+Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summary`导出`sentiment`和`official_observations`显式白名单，不发送raw；每榜每区间进一步限10条，保留真实总数与截取提示。原有DeepSeek/OpenAI/custom服务商隔离、版本绑定和用户主动发送规则继续适用。
+
+`HiThinkProvider.rate_limit_status()->{rate_limited,cooldown_seconds}`只读本机状态；`APIError.retry_after_seconds`是安全数值元信息。同进程同Key的实例共享429/4001冷却，冷却中请求快速返回受控错误。常规重试尊重可解析的Retry-After；要求等待超过15秒时不截短后立即重试，而交给调用方稍后处理。竞价仍每批单次HTTP尝试。该兼容机制不表示官网保证提供Retry-After，也不保证特定吞吐或恢复时效。
 
 ## 持久化与维护
 

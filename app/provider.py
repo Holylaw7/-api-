@@ -38,8 +38,14 @@ def urlopen(request, timeout):
 class APIError(Exception):
     """Safe to display; deliberately excludes the server's arbitrary message."""
 
-    def __init__(self, message="数据请求失败", *, code=None, request_id=None):
+    def __init__(self, message="数据请求失败", *, code=None, request_id=None,
+                 retry_after_seconds=None):
         self.code = code
+        self.retry_after_seconds = (float(retry_after_seconds)
+                                    if isinstance(retry_after_seconds, (int, float))
+                                    and not isinstance(retry_after_seconds, bool)
+                                    and math.isfinite(retry_after_seconds)
+                                    and retry_after_seconds >= 0 else None)
         self.request_id = (request_id if isinstance(request_id, str)
                            and "sk-" not in request_id.lower()
                            and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", request_id) else None)
@@ -73,6 +79,7 @@ class HiThinkProvider:
 
     _limit_lock = threading.Lock()
     _next_request: dict[str, float] = {}
+    _cooldown_until: dict[str, float] = {}
 
     def __init__(self, api_key: str, min_interval: float = 0.5, timeout: float = 6,
                  *, max_retries: int = 3):
@@ -90,17 +97,43 @@ class HiThinkProvider:
     def _throttle(self):
         with self._limit_lock:
             now = time.monotonic()
+            self._check_cooldown(now)
             slot = max(now, self._next_request.get(self._limiter_id, 0))
             self._next_request[self._limiter_id] = slot + self.min_interval
         if slot > now:
             time.sleep(slot - now)
+        # Another client may have been limited while this request waited for a slot.
+        with self._limit_lock:
+            self._check_cooldown(time.monotonic())
 
-    def _backoff(self, attempt: int, retry_after=None):
+    def _check_cooldown(self, now):
+        """Caller holds _limit_lock. Refuse queued work instead of sleeping for it."""
+        remaining = self._cooldown_until.get(self._limiter_id, 0) - now
+        if remaining > 0:
+            raise APIError("金融数据接口正在限流冷却，请稍后重试", code=4001,
+                           retry_after_seconds=remaining)
+
+    def _note_rate_limit(self, seconds):
+        with self._limit_lock:
+            self._cooldown_until[self._limiter_id] = max(
+                self._cooldown_until.get(self._limiter_id, 0), time.monotonic() + seconds)
+
+    def rate_limit_status(self):
+        """Credential-free local diagnostics; no file or network access."""
+        with self._limit_lock:
+            remaining = max(0.0, self._cooldown_until.get(self._limiter_id, 0) - time.monotonic())
+        return {"cooldown_seconds": remaining, "rate_limited": remaining > 0}
+
+    @staticmethod
+    def _retry_delay(attempt: int, retry_after=None):
+        """Parse Retry-After without copying the header into errors or logs."""
         wait = 0.5 * (2 ** attempt)
         if retry_after:
             try:
-                wait = max(wait, float(retry_after))
-            except (ValueError, TypeError):
+                seconds = float(retry_after)
+                if math.isfinite(seconds) and seconds >= 0:
+                    wait = max(wait, seconds)
+            except (ValueError, TypeError, OverflowError):
                 try:
                     retry_time = parsedate_to_datetime(retry_after)
                     if retry_time.tzinfo is None:
@@ -108,8 +141,10 @@ class HiThinkProvider:
                     wait = max(wait, (retry_time - datetime.now(timezone.utc)).total_seconds())
                 except (ValueError, TypeError, OverflowError):
                     pass
-        # Bound the whole retry path even if the upstream supplies a huge value.
-        time.sleep(min(15.0, max(0.0, wait)))
+        return max(0.0, wait)
+
+    def _backoff(self, attempt: int):
+        time.sleep(self._retry_delay(attempt))
 
     def get(self, path, params=None, *, max_retries=None) -> dict:
         if not isinstance(path, str) or not path.startswith("/api/") or "?" in path or "#" in path:
@@ -123,9 +158,11 @@ class HiThinkProvider:
             self._throttle()
             request = Request(url, headers={"X-api-key": self._api_key,
                                            "Accept": "application/json",
-                                           "User-Agent": "AuctionLab/1.0"})
+                                           "User-Agent": "AuctionLab/1.4"})
             try:
                 with urlopen(request, timeout=self.timeout) as response:
+                    headers = getattr(response, "headers", None)
+                    retry_after = headers.get("Retry-After") if headers else None
                     payload = response.read(25_000_001)
                     if len(payload) > 25_000_000:
                         raise APIError("接口响应超过安全大小，请缩小请求")
@@ -136,10 +173,17 @@ class HiThinkProvider:
                 status = error.code
                 retry_after = error.headers.get("Retry-After") if error.headers else None
                 error.close()
-                if (status == 429 or status in (500, 502, 503, 504)) and attempt < retries:
-                    self._backoff(attempt, retry_after)
+                retryable = status == 429 or status in (500, 502, 503, 504)
+                delay = self._retry_delay(attempt, retry_after) if retryable else None
+                if status == 429:
+                    self._note_rate_limit(delay)
+                # Do not shorten an upstream delay to our blocking-sleep limit.
+                # The scheduler can resume later, including single-attempt auctions.
+                if retryable and attempt < retries and delay <= 15:
+                    time.sleep(delay)
                     continue
-                raise APIError("接口 HTTP 请求失败", code=status) from None
+                raise APIError("接口 HTTP 请求失败", code=status,
+                               retry_after_seconds=delay) from None
             except (URLError, TimeoutError, OSError):
                 if attempt < retries:
                     self._backoff(attempt)
@@ -151,8 +195,12 @@ class HiThinkProvider:
                 raise APIError("接口响应信封缺少有效 code")
             code = envelope["code"]
             if code != 0:
-                if (code == 4001 or code in (5001, 5002, 5003)) and attempt < retries:
-                    self._backoff(attempt)
+                retryable = code == 4001 or code in (5001, 5002, 5003)
+                delay = self._retry_delay(attempt, retry_after) if retryable else None
+                if code == 4001:
+                    self._note_rate_limit(delay)
+                if retryable and attempt < retries and delay <= 15:
+                    time.sleep(delay)
                     continue
                 messages = {1001: "接口缺少参数", 1002: "接口参数格式错误", 1003: "接口参数超出范围",
                             1004: "接口参数冲突", 2001: "金融数据认证失败", 2003: "金融数据 Key 无效或无权限",
@@ -162,7 +210,7 @@ class HiThinkProvider:
                 if isinstance(request_id, str) and self._api_key in request_id:
                     request_id = None
                 raise APIError(messages.get(code, "金融数据上游异常"), code=code,
-                               request_id=request_id)
+                               request_id=request_id, retry_after_seconds=delay)
             data = envelope.get("data")
             if not isinstance(data, dict):
                 raise APIError("成功信封中 data 无效")
@@ -201,7 +249,7 @@ class HiThinkProvider:
         if kind not in ("limit-up", "limit-down", "limit-break"):
             raise APIError("股票池类型无效")
         path = f"/api/a-share/special-data/{kind}-pool"
-        rows, seen = [], set()
+        rows, seen, declared = [], set(), None
         for page in range(1, 501):
             data = self.get(path, {"date_ms": date_ms(date), "page": page, "size": 200})
             batch = self._items(data)
@@ -209,11 +257,27 @@ class HiThinkProvider:
             if not isinstance(paging, dict):
                 raise APIError("股票池分页信息缺失")
             total, pages = paging.get("total"), paging.get("pages")
-            if not isinstance(total, int) or total < 0 or not isinstance(pages, int) or pages < 0:
+            echoed_page, size = paging.get("page"), paging.get("size")
+            if any(not isinstance(value, int) or isinstance(value, bool) or value < 0
+                   for value in (total, pages, echoed_page, size)):
                 raise APIError("股票池分页信息无效")
+            if echoed_page != page or size != 200:
+                raise APIError("股票池分页回显与请求不一致，请重新获取")
+            # Empty pools may conventionally declare zero or one total page.
+            expected_pages = (total + size - 1) // size
+            if (total and pages != expected_pages) or (not total and pages not in (0, 1)):
+                raise APIError("股票池总页数与总条数不一致，请重新获取")
+            if declared is None:
+                declared = (total, pages)
+            elif declared != (total, pages):
+                raise APIError("股票池分页总数在读取期间变化，请重新获取")
+            expected_size = max(0, min(size, total - (page - 1) * size))
+            if len(batch) != expected_size:
+                raise APIError("股票池分页数量不完整，请重新获取")
             for row in batch:
                 code = row.get("thscode")
-                if not code or code in seen:
+                if (not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code)
+                        or code in seen):
                     raise APIError("股票池分页发生重复或缺码，请重新获取")
                 seen.add(code)
                 rows.append(row)
@@ -282,12 +346,20 @@ class HiThinkProvider:
         for offset in range(0, 100_000, 100):
             data = self.get("/api/a-share/prices/snapshot", {"limit": 100, "offset": offset})
             total = data.get("total")
-            if not isinstance(total, int) or total < 0:
+            if not isinstance(total, int) or isinstance(total, bool) or total < 0:
                 raise APIError("全市场行情缺少有效分页总数")
-            declared_total = max(declared_total or 0, total)
-            for row in self._items(data):
+            if declared_total is None:
+                declared_total = total
+            elif declared_total != total:
+                raise APIError("全市场代码表总数在分页期间变化，请重新获取")
+            batch = self._items(data)
+            if len(batch) > max(0, min(100, total - offset)):
+                raise APIError("全市场行情分页返回数量超出代码表范围")
+            # A page may omit quotes that are not ready, including an empty page.
+            for row in batch:
                 code = row.get("thscode")
-                if not code or code in seen:
+                if (not isinstance(code, str) or not re.fullmatch(r"[0-9]{6}\.(SH|SZ|BJ)", code)
+                        or code in seen):
                     raise APIError("全市场行情分页重复或缺少标的代码")
                 seen.add(code)
                 rows.append(row)
@@ -314,10 +386,18 @@ class HiThinkProvider:
         return self.get("/api/a-share/special-data/limit-up-ladder")
 
     def tickers(self, asset_type="a-share") -> list[dict]:
-        rows = []
+        rows, seen = [], set()
         for offset in range(0, 200_000, 1000):
             batch = self._items(self.get("/api/meta/tickers/list",
                                         {"asset_type": asset_type, "limit": 1000, "offset": offset}))
+            if len(batch) > 1000:
+                raise APIError("标的目录分页返回数量超出请求上限")
+            for row in batch:
+                code = row.get("thscode")
+                if (not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9]+\.[A-Za-z]{2,4}", code)
+                        or code.upper() in seen):
+                    raise APIError("标的目录分页重复或缺少有效代码")
+                seen.add(code.upper())
             rows.extend(batch)
             if len(batch) < 1000:
                 return rows

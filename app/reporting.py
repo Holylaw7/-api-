@@ -11,6 +11,8 @@ import json
 import math
 import re
 
+from .sentiment import build_sentiment
+
 
 _PRIVATE_KEYS = frozenset({
     'raw', 'config', 'credentials', 'api_key', 'apikey', 'api-key',
@@ -20,7 +22,7 @@ _PRIVATE_KEYS = frozenset({
 _TOP_KEYS = frozenset({
     'date', 'generated_at', 'completed_at', 'source', 'status', 'warnings',
     'mode', 'market', 'limit_up', 'ladder', 'trend', 'sectors',
-    'validation_note',
+    'validation_note', 'sentiment', 'official_context', 'enriched_at',
 })
 _DATE_BASIS = {
     'inferred_latest_closed_session': '休市日推断归属最近收盘日（未独立核实）',
@@ -188,6 +190,72 @@ def _ai_lines(report, ai):
     return lines
 
 
+def _sentiment_lines(value):
+    matrix, retention, reasons = (_dict(value.get(key)) for key in ('matrix', 'retention', 'reasons'))
+    lines = ['', '## 情绪结构观察', '', _text(value.get('definition')), '',
+             '### 近十日连板梯队矩阵', '', _text(matrix.get('definition')), '']
+    lines += _table(['交易日', '涨停数', '1板', '2板', '3板', '4板', '5板及以上', '高度未知', '高度仅为下限', '状态'], [
+        [row.get('date'), row.get('limit_up_count'), *[_dict(row.get('buckets')).get(key) for key in ('1','2','3','4','5+','unknown')],
+         row.get('lower_bound_count'), row.get('status')]
+        for row in _rows(matrix.get('rows'))])
+    lines += ['', '下限高度暂列入已观察到的梯队；不能据此认定最终连板高度。缺失池不是零涨停。', '',
+              '### 封单留存分布', '', _text(retention.get('definition')), '',
+              f"有效样本 {_fmt(retention.get('valid_count'))}/{_fmt(retention.get('total_count'))}；覆盖 {_fmt(retention.get('coverage_pct'), '%')}；中位数 {_fmt(retention.get('median_pct'), '%')}；低于50% {_fmt(retention.get('below_50_count'))} 只（有效样本占比 {_fmt(retention.get('below_50_pct'), '%')}）。", '',
+              f"缺失 {_fmt(retention.get('missing_count'))}；异常 {_fmt(retention.get('invalid_count'))}，其中超过100% {_fmt(retention.get('above_100_count'))}；代码冲突剔除 {_fmt(retention.get('excluded_conflict_count'))}。异常值不参与分布统计。", '',
+              '### 官方涨停原因原文分布', '', _text(reasons.get('definition')), '',
+              f"有原因 {_fmt(reasons.get('known_count'))}/{_fmt(reasons.get('total_count'))}；覆盖 {_fmt(reasons.get('coverage_pct'), '%')}；共 {_fmt(reasons.get('group_count'))} 组、展示 {_fmt(reasons.get('displayed_count'))} 组。不是行业分类或因果验证。", '']
+    lines += _table(['官方原因原文', '只数', '有原因样本占比', '代码样本', '未展示代码数'], [
+        [row.get('reason'), row.get('count'), _fmt(row.get('share_pct'), '%'), '、'.join(row.get('codes') or []), row.get('other_code_count')]
+        for row in _rows(reasons.get('rows'))])
+    for part in (value, matrix, retention, reasons):
+        lines += ['- ' + _text(warning) for warning in (part.get('warnings') or [])]
+    return lines
+
+
+def _official_lines(value):
+    if not value:
+        return ['', '## 官方补充观察', '', '尚未手动补充短线竞价风向标和龙虎榜。可在本机收盘复盘页补充后重新保存。']
+    lines = ['', '## 官方补充观察', '',
+             f"日期 {_text(value.get('date'))}；状态 {_text(value.get('status'))}；补充时间 {_text(value.get('generated_at'))}。", '',
+             _text(value.get('definition')), '']
+    benchmark = _dict(value.get('benchmark'))
+    lines += ['### 短线竞价风向标', '']
+    if benchmark:
+        lines += [_text(benchmark.get('definition')), '',
+                  f"官方样本 {_fmt(benchmark.get('sample_count'))} 只；涨幅有效 {_fmt(benchmark.get('valid_auction_count'))} 只；平均 {_fmt(benchmark.get('mean_auction_pct'), '%')}；中位 {_fmt(benchmark.get('median_auction_pct'), '%')}；正涨幅占有效样本 {_fmt(benchmark.get('positive_ratio_pct'), '%')}。", '']
+        lines += _table(['代码', '股票', '竞价涨幅', '官方标签'], [
+            [row.get('thscode'), row.get('name'), _fmt(row.get('auction_pct'), '%'), '、'.join(row.get('tags') or [])]
+            for row in _rows(benchmark.get('rows'))])
+    else:
+        lines += ['该分项不可用；不能视为零。']
+    for key, label in (('all','全部龙虎榜'), ('org','机构龙虎榜'), ('hot_money','游资龙虎榜')):
+        board = _dict(_dict(value.get('dragon_tiger')).get(key))
+        lines += ['', '### ' + label, '']
+        if not board:
+            lines += ['该分项不可用；不能视为空榜。']
+            continue
+        lines += [_text(board.get('definition')), '',
+                  f"交易日 {_text(board.get('trade_date'))}；上游记录数 {_fmt(board.get('reported_count'))}、股票数 {_fmt(board.get('reported_stock_count'))}；展开收到 {_fmt(board.get('received_rows'))} 条、可识别 {_fmt(board.get('observed_stock_count'))} 只股票，重复记录 {_fmt(board.get('duplicate_record_count'))} 条。每个区间最多展示30条，金额均为亿元；不加总跨榜、跨区间或重复记录。", '']
+        if key == 'hot_money':
+            lines += ['上游计数与按游资展开样本范围不同，不能直接用两者相除计算完整覆盖率。', '']
+        if _dict(board.get('coverage')).get('definition'):
+            lines += [_text(board['coverage']['definition']), '']
+        for group, period in (('one_day','1日榜'), ('three_day','3日榜'), ('other','其他或未知区间')):
+            rows = _rows(_dict(board.get('groups')).get(group))
+            count = _dict(board.get('group_counts')).get(group)
+            lines += ['', '#### ' + period, '', f"收到 {_fmt(count)} 条；展示 {len(rows)} 条。", '']
+            if count == 0:
+                lines += ['该区间返回空列表。']
+                continue
+            net = {'all':'net_value', 'org':'org_net_value', 'hot_money':'hot_money_item_net_value'}[key]
+            lines += _table(['代码', '股票', '游资', '涨跌幅', '对应榜单净买入', '区间天数', '涨跌停原因', '质量'], [
+                [row.get('thscode'), row.get('name'), row.get('hot_money_name'), _fmt(row.get('change_pct'), '%'),
+                 _money(row.get(net)), row.get('range_days'), row.get('limit_reason'), _quality(row.get('quality'))]
+                for row in rows])
+    lines += ['- ' + _text(warning) for warning in (value.get('warnings') or [])]
+    return lines
+
+
 def render_markdown(report: dict, ai: dict | None = None, comparison: dict | None = None) -> str:
     """Render human-readable, safe Markdown without doing IO or market work."""
     if not isinstance(report, dict) or not isinstance(report.get('date'), str):
@@ -255,6 +323,8 @@ def render_markdown(report: dict, ai: dict | None = None, comparison: dict | Non
         [row.get('name'), row.get('thscode'), row.get('as_of'), row.get('close'), row.get('ma5'), row.get('ma10'), row.get('ma20'),
          _fmt(row.get('return_5d_pct'), '%'), row.get('volume_ratio_5d'), _fmt(row.get('max_drawdown_20d_pct'), '%'), row.get('status')]
         for row in _rows(trend.get('price_leaders'))[:20]])
+    lines += _sentiment_lines(report.get('sentiment') or build_sentiment({**report, 'mode':mode}))
+    lines += _official_lines(_dict(report.get('official_context')))
     lines += _observation_lines(limits)
     if comparison is not None:
         lines += _comparison_lines(report, comparison)

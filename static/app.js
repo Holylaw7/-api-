@@ -140,6 +140,8 @@
   function render(snapshot) {
     if (!snapshot || typeof snapshot !== 'object') return;
     state.snapshot = snapshot;
+    state.snapshotReceivedAt = Date.now();
+    state.apiCooldownDeadline = Date.now() + (numeric(snapshot.api?.cooldown_seconds) ? Math.max(0, Number(snapshot.api.cooldown_seconds)) * 1000 : 0);
     hydrateConfig(snapshot);
     if (!state.watchlistSettingsDirty && document.activeElement !== $('watchlist')) $('watchlist').value = (snapshot.config?.watchlist || []).join(', ');
     const demo = snapshot.mode === 'demo';
@@ -193,6 +195,7 @@
     renderAuction();
     renderStocks(snapshot.stocks || {}, snapshot.jobs || {});
     renderReview(snapshot.review, snapshot.jobs?.review);
+    renderResearch(snapshot);
     renderReportControls();
     const reviewJobStatus = snapshot.jobs?.review?.status;
     if (state.reviewJobStatus === 'running' && reviewJobStatus === 'done') {
@@ -658,6 +661,127 @@
     finally { state.diagnosticsBusy = false; $('diagnostics-refresh').disabled = false; }
   }
 
+  const researchStatus = (status) => ({ready: '已取得', partial: '部分数据', unavailable: '尚不可用', cancelled: '已中断'}[status] || '未补充');
+  const pctValue = (value) => numeric(value) ? `${num(value, 1)}%` : '—';
+  const researchMetric = (label, value, note) => `<div class="research-metric"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`;
+  const researchWarnings = (warnings) => {
+    const rows = [...new Set(list(warnings).filter(Boolean))];
+    return rows.length ? `<details><summary>数据质量与缺失说明 · ${rows.length} 项</summary><ul>${rows.map((item) => `<li>${esc(item)}</li>`).join('')}</ul></details>` : '';
+  };
+  const datedStockButton = (code, date, name) => /^[0-9]{6}\.(SH|SZ|BJ)$/.test(code || '')
+    ? `<button class="research-code" data-query-stock="${esc(code)}" data-query-date="${esc(date)}" title="查询 ${esc(date)} 截止日的 ${esc(code)}">${name ? `<strong>${esc(name)}</strong>` : ''}<span>${esc(code)}</span></button>`
+    : `<span class="subtle">${esc(name || '代码缺失')}</span>`;
+
+  function officialBlockedReason() {
+    const snapshot = state.snapshot || {};
+    if (snapshot.mode === 'demo' || snapshot.review?.mode === 'demo') return '演示模式不请求真实官方观察。';
+    if (!snapshot.review?.date || !snapshot.review_id) return '请先生成或读取一份已收盘的真实报告。';
+    const stamp = new Date(snapshot.now || Date.now()).getTime() + Math.max(0, Date.now() - (state.snapshotReceivedAt || Date.now()));
+    const hhmm = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false}).format(new Date(stamp));
+    if (hhmm >= '09:10' && hhmm <= '09:26') return '09:10—09:26 为竞价保护时段，09:27 后可补充官方观察。';
+    if (snapshot.jobs?.review?.status === 'running') return '复盘正在生成，完成后可补充。';
+    if (state.evidenceBusy || snapshot.jobs?.evidence?.status === 'running') return '正在补充官方观察，请等待当前任务完成。';
+    if (snapshot.api?.rate_limited && (state.apiCooldownDeadline || 0) > Date.now()) return '行情接口正在限流冷却，结束后可补充。';
+    return '';
+  }
+
+  function renderOfficialControls() {
+    const report = state.snapshot?.review;
+    const job = state.snapshot?.jobs?.evidence || {};
+    const reason = officialBlockedReason();
+    $('official-enrich').disabled = Boolean(reason);
+    $('official-enrich').title = reason || '按当前报告日期读取最多四个官方分项，不调用 AI。';
+    $('official-enrich').textContent = state.evidenceBusy || job.status === 'running' ? '正在补充…' : report?.official_context ? '重新补充官方观察' : '联网补充官方观察';
+    const status = job.status === 'error' ? `最近一次补充任务失败：${job.message || '请检查接口状态后重试'}`
+      : job.status === 'running' ? job.message || reason
+      : reason || (job.status === 'done' ? `${job.message || '补充任务已结束'}；请核对下方各分项的日期与缺失说明。` : '手动补充最多 4 个官方分项；完成后可用上方「保存 Markdown」留存。');
+    text('official-job-status', state.evidenceSubmitError || status);
+    $('official-job-status').classList.toggle('warn', Boolean(state.evidenceSubmitError) || job.status === 'error');
+    const unavailable = Boolean(state.snapshot?.jobs?.evidence?.status === 'running');
+    if (unavailable) {
+      $('report-load').disabled = true;
+      document.querySelectorAll('[data-action="review"]').forEach((button) => { button.disabled = true; });
+    }
+  }
+
+  async function enrichReport() {
+    const reason = officialBlockedReason();
+    if (reason) { toast(reason); return; }
+    const body = {date: state.snapshot.review.date, review_id: state.snapshot.review_id};
+    state.evidenceBusy = true;
+    state.evidenceSubmitError = '';
+    renderOfficialControls();
+    try {
+      const result = await api('/api/reports/enrich', body);
+      toast(result.message || `${body.date} 官方观察已提交`);
+      await fetchState();
+    } catch (error) { state.evidenceSubmitError = `补充提交失败：${error.message}`; toast(error.message, true); }
+    finally { state.evidenceBusy = false; renderOfficialControls(); }
+  }
+
+  function renderResearch(snapshot) {
+    const report = snapshot.review;
+    const sentiment = snapshot.review_sentiment || report?.sentiment;
+    const official = report?.official_context;
+    const signature = JSON.stringify([displayedReportKey(), sentiment?.version, sentiment?.status, official?.generated_at]);
+    if (state.researchSignature === signature) return;
+    state.researchSignature = signature;
+    state.evidenceSubmitError = '';
+    const date = report?.date || '—';
+    text('sentiment-date', report ? `${date}${snapshot.mode === 'demo' ? ' · DEMO' : ''}` : '等待报告');
+    text('sentiment-summary', sentiment ? `${researchStatus(sentiment.status)} · ${sentiment.definition || '仅描述所选日期的已留存涨停证据。'}` : '读取已有报告即可计算，不新增行情请求，不生成预测。');
+    const matrix = sentiment?.matrix || {}, retention = sentiment?.retention || {}, reasons = sentiment?.reasons || {};
+    $('sentiment-retention').innerHTML = [
+      researchMetric('封单留存中位数', pctValue(retention.median_pct), `有效 ${num(retention.valid_count, 0)} / 全池 ${num(retention.total_count, 0)} · 覆盖 ${pctValue(retention.coverage_pct)}`),
+      researchMetric('留存低于 50% 的占比', pctValue(retention.below_50_pct), `${num(retention.below_50_count, 0)} 只 / ${num(retention.valid_count, 0)} 只有效样本`),
+      researchMetric('留存超过 100% 的异常', num(retention.above_100_count, 0), `异常剔除；其他无效 ${num(retention.invalid_count, 0)} · 缺失 ${num(retention.missing_count, 0)}`)
+    ].join('');
+    text('sentiment-coverage', `完整 ${num(matrix.coverage?.complete_days, 0)} / ${num(matrix.coverage?.expected_days, 0)} 日 · ${matrix.coverage?.calendar_verified ? '交易日历已核验' : '交易日连续性未确认'}`);
+    const days = list(matrix.rows).slice(-10);
+    const maxCell = Math.max(1, ...days.flatMap((row) => Object.values(row.buckets || {}).filter(numeric).map(Number)));
+    $('sentiment-matrix-body').innerHTML = days.length ? days.map((row) => `<tr><td>${esc(row.date)}</td><td>${esc(num(row.limit_up_count, 0))}</td>${['1', '2', '3', '4', '5+', 'unknown'].map((key) => {
+      const value = row.buckets?.[key], lower = row.lower_bound_by_bucket?.[key];
+      return `<td class="heat-cell" style="--cell-strength:${numeric(value) ? .035 + Number(value) / maxCell * .22 : 0}"><strong>${esc(num(value, 0))}</strong>${numeric(lower) && Number(lower) > 0 ? `<small>下限 ${esc(num(lower, 0))}</small>` : ''}</td>`;
+    }).join('')}<td>${esc(num(row.lower_bound_count, 0))}</td><td><span class="${row.coverage?.complete ? 'neutral' : 'research-warn'}">${row.coverage?.complete ? '完整' : '不完整'}</span><small class="sector-source">观察 ${esc(num(row.coverage?.observed_count, 0))} 只</small></td></tr>`).join('') : '<tr><td colspan="10" class="table-empty">尚无可核验的逐日完整涨停池，缺失不记作零。</td></tr>';
+    text('sentiment-reason-coverage', `有原因 ${num(reasons.known_count, 0)} / 全池 ${num(reasons.total_count, 0)} · 共 ${num(reasons.group_count, 0)} 组 · 覆盖 ${pctValue(reasons.coverage_pct)}`);
+    $('sentiment-reasons-body').innerHTML = list(reasons.rows).length ? list(reasons.rows).slice(0, 12).map((row) => `<tr><td class="research-reason">${esc(row.reason)}</td><td>${esc(num(row.count, 0))}</td><td>${esc(pctValue(row.share_pct))}</td><td><div class="research-codes">${list(row.codes).slice(0, 10).map((code) => datedStockButton(code, date)).join('')}</div>${numeric(row.other_code_count) && row.other_code_count > 0 ? `<small class="sector-source">另 ${esc(num(row.other_code_count, 0))} 只未展开</small>` : ''}</td></tr>`).join('') : '<tr><td colspan="4" class="table-empty">暂无可用官方涨停原因；不由名称或其他标签推测。</td></tr>';
+    $('sentiment-warnings').innerHTML = researchWarnings([...list(sentiment?.warnings), ...days.flatMap((row) => list(row.warnings).map((warning) => `${row.date}：${warning}`)), ...(retention.definition ? [retention.definition] : [])]);
+    renderOfficialContext(official, report);
+  }
+
+  function renderOfficialContext(context, report) {
+    const date = report?.date;
+    text('official-context-date', date ? `观察日期 ${date}${date < dateAtShanghai() ? ' · 历史报告' : ''}` : '尚未生成报告');
+    const valid = context && context.date === date && context.mode === state.snapshot?.mode;
+    text('official-context-status', valid ? researchStatus(context.status) : context ? '日期或模式不匹配' : '未补充');
+    if (!valid) {
+      $('official-context-body').innerHTML = `<div class="table-empty">${context ? '补充数据与当前报告日期或模式不一致，未显示。请重新补充。' : '点击上方按钮，为当前报告补充可核验的同日观察。'}</div>`;
+      return;
+    }
+    const benchmark = context.benchmark;
+    const benchValid = benchmark?.date === date;
+    const benchmarkHtml = `<section class="official-benchmark"><div class="research-section-heading"><h3>短线风向标 · 竞价样本</h3><span class="subtle">${esc(date)} · ${benchValid ? researchStatus(benchmark.status) : '未取得'}</span></div>${benchValid ? `<div class="research-metrics">${researchMetric('竞价涨幅均值', percent(benchmark.mean_auction_pct), '有效样本计算，百分数原值')}${researchMetric('竞价涨幅中位数', percent(benchmark.median_auction_pct), `有效 ${num(benchmark.valid_auction_count, 0)} / 样本 ${num(benchmark.sample_count, 0)}`)}${researchMetric('正涨幅样本占比', pctValue(benchmark.positive_ratio_pct), '零涨幅计入分母，不计上涨')}</div><p class="research-note">官方样本并非全市场；本页显示 ${esc(num(benchmark.shown_count, 0))} / ${esc(num(benchmark.sample_count, 0))} 只。标签仅作来源说明，不参与评分。</p><div class="official-sample-list">${list(benchmark.rows).slice(0, 30).map((row) => `<div>${datedStockButton(row.thscode, date, row.name)}<span class="${tone(row.auction_pct)}">${esc(percent(row.auction_pct))}</span><small>${esc(list(row.tags).join(' · ') || '无标签')}</small></div>`).join('') || '<p class="research-note">官方返回空样本，均值、中位数及上涨占比均保持未知。</p>'}</div>` : '<p class="research-note research-warn">风向标分项未取得或日期不匹配，不以零代替。</p>'}</section>`;
+    const boardsHtml = ['all', 'org', 'hot_money'].map((key) => renderOfficialBoard(context.dragon_tiger?.[key], key, date)).join('');
+    const errors = list(context.errors).map((error) => `${({benchmark:'风向标',all:'全部龙虎榜',org:'机构龙虎榜',hot_money:'游资龙虎榜'})[error.section] || error.section}：${error.message || '分项失败'}${numeric(error.code) ? `（code=${error.code}）` : ''}`);
+    $('official-context-body').innerHTML = `<p class="research-note">补充于 ${esc(time(context.generated_at, true))} · 已请求 ${esc(num(context.requests?.attempted, 0))} / ${esc(num(context.requests?.max, 0))} 分项${context.cancelled ? ' · 任务已中断，未请求部分保留为空' : ''}</p>${errors.length ? `<div class="official-errors" role="status">${errors.map((error) => `<p>${esc(error)}</p>`).join('')}</div>` : ''}${benchmarkHtml}<div class="official-boards">${boardsHtml}</div><div class="research-warnings">${researchWarnings(context.warnings)}</div>`;
+  }
+
+  function renderOfficialBoard(board, key, date) {
+    const label = {all: '全部龙虎榜', org: '机构龙虎榜', hot_money: '游资龙虎榜'}[key];
+    const netField = {all: 'net_value', org: 'org_net_value', hot_money: 'hot_money_item_net_value'}[key];
+    const netLabel = {all: '榜单净买入', org: '机构净买入', hot_money: '该游资该股净买入'}[key];
+    const valid = board?.trade_date === date && board?.board_type === key;
+    const heading = `<summary><strong>${label}</strong><span>${valid ? `${esc(num(board.received_rows, 0))} 条记录 · ${researchStatus(board.status)}` : '分项未取得'}</span></summary>`;
+    if (!valid) return `<details class="official-board" open>${heading}<p class="research-note research-warn">${esc(date)} 的该分项尚不可用；不能据此认定无股票上榜。</p></details>`;
+    const groups = [['one_day', '1 日榜'], ['three_day', '3 日榜'], ['other', '其他 / 未知区间']].map(([groupKey, groupLabel]) => {
+      const rows = list(board.groups?.[groupKey]);
+      const header = `<div class="official-group-heading"><h4>${groupLabel}</h4><span>显示 ${rows.length} / ${esc(num(board.group_counts?.[groupKey], 0))} 条</span></div>`;
+      if (!rows.length) return `<section>${header}<p class="research-note">本次分项返回该区间 0 条记录。</p></section>`;
+      return `<section>${header}<div class="table-scroll"><table class="data-table official-board-table"><thead><tr><th>股票 · 查询同日</th>${key === 'hot_money' ? '<th>游资名称</th>' : ''}<th>涨幅</th><th>${netLabel}（万元）</th><th>涨跌停原因 / 数据说明</th></tr></thead><tbody>${rows.slice(0, 30).map((row) => `<tr><td>${datedStockButton(row.thscode, date, row.name)}</td>${key === 'hot_money' ? `<td class="research-reason">${esc(row.hot_money_name || '未知')}</td>` : ''}<td class="${tone(row.change_pct)}">${esc(percent(row.change_pct))}</td><td class="${tone(row[netField])}">${numeric(row[netField]) ? esc(num(Number(row[netField]) / 10000, 2)) : '—'}</td><td class="research-reason">${esc(row.limit_reason || '原因未提供')}${row.duplicate_record ? '<small class="research-warn">同股同区间多条记录 · 不累计</small>' : ''}${list(row.quality).length ? `<small>${esc(list(row.quality).join('；'))}</small>` : ''}${groupKey === 'other' ? `<small>原始区间 ${esc(num(row.range_days, 0))} 日</small>` : ''}</td></tr>`).join('')}</tbody></table></div></section>`;
+    }).join('');
+    return `<details class="official-board">${heading}<p class="research-note">${esc(date)} · 上游记录 ${esc(num(board.reported_count, 0))} 条 / 股票 ${esc(num(board.reported_stock_count, 0))} 只 · 本页接收 ${esc(num(board.received_rows, 0))} 条 / 可识别股票 ${esc(num(board.observed_stock_count, 0))} 只 · 各区间最多显示 30 条${board.truncated ? '，部分记录未展开' : ''}。${key === 'hot_money' ? '本页按游资与股票展开，与上游总计范围不同，不据此计算完整覆盖率；未逐行相加游资聚合净额。' : ''}</p>${board.coverage?.definition ? `<p class="research-note">${esc(board.coverage.definition)}</p>` : ''}${groups}<div class="research-warnings">${researchWarnings(board.warnings)}</div></details>`;
+  }
+
   function renderReview(report, job) {
     const signature = displayedReportKey();
     const changed = state.reportSignature !== signature;
@@ -815,6 +939,11 @@
   }
 
   function tick() {
+    const limited = state.snapshot?.mode !== 'demo' && state.snapshot?.api?.rate_limited === true;
+    const remaining = Math.max(0, Math.ceil(((state.apiCooldownDeadline || 0) - Date.now()) / 1000));
+    $('api-cooldown').classList.toggle('hidden', !limited);
+    text('api-cooldown-text', remaining > 0 ? `约 ${num(remaining, 0)} 秒后可恢复请求；同一 Key 的后台请求同步暂停，已有观测继续保留。` : '冷却时间已到，等待服务确认；已有观测继续保留。');
+    renderOfficialControls();
     text('clock', time(new Date().toISOString()));
     const auction = state.snapshot?.auction || {};
     const latest = auction.summary?.last_received_at || list(auction.rows).reduce((last, row) => row.updated_at && (!last || row.updated_at > last) ? row.updated_at : last, '');
@@ -865,7 +994,10 @@
     const nav = event.target.closest('[data-tab],[data-open]');
     if (nav) { showPage(nav.dataset.tab || nav.dataset.open); return; }
     const stockQuery = event.target.closest('[data-query-stock]');
-    if (stockQuery) { await queryStock(stockQuery.dataset.queryStock, stockQuery); return; }
+    if (stockQuery) {
+      if (Object.prototype.hasOwnProperty.call(stockQuery.dataset, 'queryDate')) $('stock-query-date').value = stockQuery.dataset.queryDate;
+      await queryStock(stockQuery.dataset.queryStock, stockQuery); return;
+    }
     const stockAdd = event.target.closest('[data-add-stock]');
     if (stockAdd) { await addWatchlist(stockAdd.dataset.addStock, stockAdd); return; }
     const stockRemove = event.target.closest('[data-remove-stock]');
@@ -904,6 +1036,7 @@
   $('comparison-baseline').addEventListener('change', () => { resetComparison(); renderReportControls(); });
   $('comparison-run').addEventListener('click', compareReports);
   $('diagnostics-refresh').addEventListener('click', loadDiagnostics);
+  $('official-enrich').addEventListener('click', enrichReport);
   window.addEventListener('hashchange', () => showPage(location.hash.slice(1) || 'auction'));
   $('toggle-errors').addEventListener('click', () => { const closed = $('errors-list').classList.toggle('hidden'); text('toggle-errors', closed ? '展开' : '收起'); });
   $('weights-editor').addEventListener('input', (event) => {

@@ -277,6 +277,10 @@ def readiness(snapshot, internal=None):
         return {"status": "error", "summary": "无法确认数据模式", "checked_at": snapshot.get("now"), "checks": checks}
     add("credentials", "数据接入", "ok" if snapshot.get("configured") else "error",
         "已配置数据凭据；不代表本次远程鉴权已验证。" if snapshot.get("configured") else "未配置数据 API Key，请在策略与接入中保存。")
+    cooldown = _number(_dict(snapshot.get('api')).get('cooldown_seconds'))
+    if cooldown is not None and cooldown > 0:
+        add('api_cooldown', '接口限流恢复', 'warn',
+            f'接口限流或暂缓请求，冷却约 {cooldown:.0f} 秒后恢复；已有观察保留，不补造等待期间数据。')
     if current is None:
         add("clock", "本机时点", "error", "缺少有效且含时区的当前时间，无法核对采集时段。")
     calendar = _dict(snapshot.get("calendar"))

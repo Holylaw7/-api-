@@ -32,6 +32,7 @@ def success(data):
 class ProviderTests(unittest.TestCase):
     def setUp(self):
         HiThinkProvider._next_request.clear()
+        HiThinkProvider._cooldown_until.clear()
         self.provider = HiThinkProvider("fixture-secret", min_interval=0)
 
     @patch("app.provider.urlopen")
@@ -53,9 +54,13 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(captured.exception.code, 3002)
         self.assertEqual(open_mock.call_count, 1)
 
+    @patch("app.provider.time.monotonic")
     @patch("app.provider.time.sleep")
     @patch("app.provider.urlopen")
-    def test_business_rate_limit_bounded_retry(self, open_mock, sleep_mock):
+    def test_business_rate_limit_bounded_retry(self, open_mock, sleep_mock, clock_mock):
+        clock = [100.0]
+        clock_mock.side_effect = lambda: clock[0]
+        sleep_mock.side_effect = lambda seconds: clock.__setitem__(0, clock[0] + seconds)
         error = Response({"code": 4001, "message": "slow", "data": None})
         open_mock.side_effect = [error, error, error, success({"item": []})]
         self.assertEqual(self.provider.get("/api/test"), {"item": []})
@@ -64,11 +69,14 @@ class ProviderTests(unittest.TestCase):
 
     @patch("app.provider.time.sleep")
     @patch("app.provider.urlopen")
-    def test_http429_retry_after_is_respected_and_bounded(self, open_mock, sleep_mock):
+    def test_http429_long_retry_after_is_deferred_without_early_retry(self, open_mock, sleep_mock):
         open_mock.side_effect = [HTTPError("https://example.invalid", 429, "busy", {"Retry-After": "99999"}, io.BytesIO()),
                                  success({"item": []})]
-        self.provider.get("/api/test")
-        sleep_mock.assert_called_once_with(15.0)
+        with self.assertRaises(APIError) as captured:
+            self.provider.get("/api/test")
+        self.assertEqual(captured.exception.retry_after_seconds, 99999)
+        self.assertEqual(open_mock.call_count, 1)
+        sleep_mock.assert_not_called()
 
     @patch("app.provider.time.sleep")
     @patch("app.provider.urlopen")
@@ -131,15 +139,15 @@ class ProviderTests(unittest.TestCase):
     @patch.object(HiThinkProvider, "get")
     def test_complete_pool_pagination_over200(self, get_mock):
         first = [{"thscode": f"{index:06}.SH"} for index in range(200)]
-        get_mock.side_effect = [{"pagination": {"total": 201, "pages": 2}, "item": first},
-                                {"pagination": {"total": 201, "pages": 2}, "item": [{"thscode": "600000.SH"}]}]
+        get_mock.side_effect = [{"pagination": {"total": 201, "pages": 2, "page": 1, "size": 200}, "item": first},
+                                {"pagination": {"total": 201, "pages": 2, "page": 2, "size": 200}, "item": [{"thscode": "600000.SH"}]}]
         self.assertEqual(len(self.provider.pool("limit-up", "2026-09-18")), 201)
         self.assertEqual(get_mock.call_args_list[1].args[1]["page"], 2)
         self.assertEqual(get_mock.call_args_list[0].args[1]["date_ms"], date_ms("2026-09-18"))
 
     @patch.object(HiThinkProvider, "get")
     def test_pool_incomplete_raises_instead_of_silent_truncation(self, get_mock):
-        get_mock.return_value = {"pagination": {"total": 2, "pages": 1}, "item": [{"thscode": "600000.SH"}]}
+        get_mock.return_value = {"pagination": {"total": 2, "pages": 1, "page": 1, "size": 200}, "item": [{"thscode": "600000.SH"}]}
         with self.assertRaises(APIError):
             self.provider.pool("limit-up", "2026-09-18")
 
