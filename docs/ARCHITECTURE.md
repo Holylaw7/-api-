@@ -1,6 +1,6 @@
 # 架构与二次开发
 
-版本1.5。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
+版本1.6。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。指定板块取数见 `docs/SECTOR_RESEARCH.md`，历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
 
 ## 模块与数据流
 
@@ -20,6 +20,9 @@ report_library.py ↔ storage.py / 报告JSON → reporting.py → Markdown保�
 insights.py → 两期报告比较 / 本机就绪检查（不请求行情）
 sentiment.py → 留存完整池的情绪结构（不请求行情）
 official_context.py → 手动、显式日期的风向标 / 龙虎榜 → 新版本报告
+sector_research.py → 指定板块与成员取数 → sector_library.py → 独立证据档案
+                                                ↓
+                            llm.py targeted_sectors → 一次可选模型生成
 daily_validation.py → 当日两时点评分冻结 → 收盘结果核验 → 每日版本档案
 research_data.py → 有界历史JSON导入 → research.py → replay.py → AuctionEngine
                                               ↓
@@ -88,7 +91,11 @@ research_data.py → 有界历史JSON导入 → research.py → replay.py → Au
 | POST `/api/trends/refresh` | `{}`；按最近已收盘日后台刷新有限候选趋势池，保护时段拒绝开始 |
 | POST `/api/credentials` | 保存数据 Key 到用户凭据文件并启动 |
 | POST `/api/llm-config` | 保存模型端点、模型 ID、独立 Key |
-| POST `/api/llm` | question/provider可选；review_date/review_id限定为指定版本报告专属研判 |
+| POST `/api/llm` | question/provider可选；review_date/review_id限定为指定版本报告专属研判；fetch_sectors=true及sector_codes开启先取指定板块再调用模型 |
+| POST `/api/sectors/search` | query名称或完整代码；读取/复用行业概念全目录，返回候选 |
+| POST `/api/sectors/research` | codes/date/review_id；后台只取数，不调用模型 |
+| GET `/api/sectors/research` | date/review_id；本机读取对应版本最近证据 |
+| GET `/api/sectors/export` | evidence_id；校验并下载独立证据JSON |
 
 所有 POST 要求同源及 `X-Local-App: auction-lab`；请求 Host 必须是本机服务地址，降低跨站和 DNS 重绑定风险。GET 不回显凭据。静态文件是白名单，不能下载 SQLite、Python 源码或凭据。远程 LLM 强制 HTTPS，重定向禁止转发 Key。
 
@@ -206,6 +213,18 @@ Service分开维护`review`、`latest_review`和`viewing_archive`。前者只代
 `GET /api/research/ai-dataset?id=...` 只发开发日期，不给保留标签；开发不足可为空。`POST /api/research/proposals` 只归档七因子有限非负权重、模型来源、理由及实验/数据摘要，状态为 `awaiting_future_validation`。完整每日/实验/原始历史导出可能含保留期结果，不应用来继续自动调参。系统不隐式调用模型，也不自动将建议加入当前搜索或实盘配置；后续验证须使用新日期。
 
 新增接口完整请求约束以 `CONTRACT.md` 为准。新增研究文件均在 `data/research/`，原始批次留在 SQLite，不因迭代实验清理；源码指纹不是源码备份，严格复现还应保存对应 Git 提交。
+
+## 指定板块构建与证据档案（1.6）
+
+`sector_research.py`只接收provider和捕获的完整基报告，不读取密钥、不落盘、不运行模型。行业与概念两份官方目录经代码/名称/类别校验后搜索；`Service._sector_catalog`用独立锁缓存15分钟。定向取数有单独非阻塞锁，避免同一时刻重复重型构建。请求前后通过`should_stop`检查模式、关闭、generation和09:10–09:26保护，不持有全局行情锁执行网络操作。
+
+构建器每次核验官方日历，读取最多3板块的当前成员和60自然日指数日线。先使用基报告可核验日期的市场行情；最近收盘日不足样本补快照，旧日只补按代码顺序每板最多20个股票短日线。总最新快照代码最多300、历史短日线最多60；全部3板块构建上限为最新日10次或历史日67次业务调用，主服务目录未命中另2次，重试另计。成员归属和涨停交集以当前组成明确标记，无法还原历史指数成分。
+
+`sector_library.py`深复制结果，绑定date/live/review_id后，以规范JSON SHA-256前24位保存独立证据；同id不重写，最新指针按报告日期与版本隔离。读取只接受固定id并验证内容摘要，文件上限8MiB。它不会修改原报告、原report_identity、竞价批次或股票池。SSE只附匹配当前报告版本的轻量证据摘要，详细数据经专用GET读取，避免每次竞价推送重复发送成员明细。
+
+`run_llm(fetch_sectors=True)`固定所选模型配置和报告版本，先检查AI Key存在，再构建和保存证据；全部无可用证据、取消或模型调用前版本变化均阻止模型生成。部分可用证据连同覆盖及缺失进入`llm._targeted_sector_summary`独立白名单，最多3板块、各30同行和30涨停成员；未知raw/配置/敏感字段不进入提示词。JSON最多100/30行，UI最多20/20行，统计保留原样本口径，各层追加展示数量和截断提示。
+
+AI结果记录本次问题及sector_codes/sector_evidence_id/sector_generated_at，仍按报告scope、日期、模式、provider和review_id绑定。Markdown只附已匹配回答及证据来源，不把补充反写进原基础报告；详细证据另存JSON。独立助手8766不新增隐式金融访问能力。完整接口及操作说明见 [SECTOR_RESEARCH.md](SECTOR_RESEARCH.md)。
 
 ## 独立 AI 应用（1.2）
 

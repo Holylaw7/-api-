@@ -73,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         try:
             if path == '/api/health':
-                self._json({'ok':True,'application':'auction-lab','version':'1.5.0'})
+                self._json({'ok':True,'application':'auction-lab','version':'1.6.0'})
             elif path == '/api/state':
                 self._json(service.snapshot())
             elif path == '/api/events':
@@ -133,6 +133,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._markdown(data, filename)
             elif path == '/api/diagnostics':
                 self._json(service.diagnostics())
+            elif path == '/api/sectors/research':
+                query = parse_qs(urlsplit(self.path).query)
+                self._json(service.sector_research_result(query.get('date',[None])[0], query.get('review_id',[None])[0]))
+            elif path == '/api/sectors/export':
+                query = parse_qs(urlsplit(self.path).query)
+                evidence = service.sector_library.get(query.get('evidence_id',[None])[0])
+                self._json(service._public_report(evidence), attachment='sector-evidence-'+evidence['evidence_id']+'.json')
             elif path == '/api/research':
                 self._json(service.research_library.latest())
             elif path == '/api/research/template':
@@ -242,6 +249,12 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/reports/load':
                 service.load_report(body.get('date'))
                 message = '已读取本机历史报告，未重新请求行情'
+            elif path == '/api/sectors/search':
+                self._json(dict(service.search_sectors(body.get('query')), ok=True))
+                return
+            elif path == '/api/sectors/research':
+                started = service.run_sector_research(body.get('codes'), body.get('date'), body.get('review_id'))
+                message = '正在读取指定板块的官方数据' if started else '已有板块取数正在运行'
             elif path == '/api/reports/enrich':
                 started = service.enrich_report(body.get('date'), body.get('review_id'))
                 message = '正在补充所选日期的官方观察' if started else '已有官方观察任务，请等待完成'
@@ -287,7 +300,8 @@ class Handler(BaseHTTPRequestHandler):
                 started = service.run_llm_test(body.get('provider'))
                 message = '正在检查授权与模型列表，不生成回答' if started else '连接测试正在进行'
             elif path == '/api/llm':
-                started = service.run_llm(str(body.get('question','')), body.get('provider'), body.get('review_date'), body.get('review_id'))
+                started = service.run_llm(str(body.get('question','')), body.get('provider'), body.get('review_date'), body.get('review_id'),
+                    sector_codes=body.get('sector_codes'), fetch_sectors=body.get('fetch_sectors',False))
                 message = '正在调用所选模型，结构化排名不受模型速度影响' if started else '已有 AI 分析正在进行'
             else:
                 self._json({'ok':False,'message':'操作不存在'},404)

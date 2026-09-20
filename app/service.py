@@ -24,6 +24,8 @@ from .official_context import build_official_context
 from .research import ResearchLibrary, CHECKPOINTS
 from .research_data import pool_rows
 from .daily_validation import DailyValidation
+from .sector_library import SectorLibrary
+from .sector_research import load_catalog, search_catalog, validate_sector_codes, build_sector_research
 
 SH = timezone(timedelta(hours=8), name='Asia/Shanghai')
 
@@ -54,6 +56,12 @@ class Service:
         self.report_library = ReportLibrary(self.store, self.data_dir)
         self.research_library = ResearchLibrary(self.store, self.data_dir)
         self.daily_validation = DailyValidation(self.store, self.data_dir)
+        self.sector_library = SectorLibrary(self.data_dir)
+        self.sector_summary = {}
+        self.sector_catalog = []
+        self.sector_catalog_at = 0
+        self.sector_catalog_lock = threading.Lock()
+        self.sector_fetch_lock = threading.Lock()
         try:
             research = self.research_library.latest()
         except ValueError:
@@ -223,6 +231,8 @@ class Service:
                          review=self._public_report(self.review), review_id=self._review_identity(),
                          review_sentiment=self._review_sentiment(), api=self._api_status(), jobs=self.jobs, config=self.config,
                          research=self.research_summary,
+                         sector_research=(self.sector_summary if self.mode == 'live' and
+                             self.sector_summary.get('review_id') == self._review_identity() else {}),
                          llm=dict(**ai_state, configured=active['configured'], base_url=active['base_url'],
                                   model=active['model'], label=active['label'],
                                   result=self.llm_results.get(active['id']),
@@ -915,10 +925,96 @@ class Service:
     def _save_markdown(self, report):
         return self.report_library.save(report)
 
-    def run_llm(self, question='', provider=None, review_date=None, review_id=None):
+    def _sector_guard(self, generation=None):
+        if self.mode != 'live':
+            raise ValueError('演示中不能读取真实板块数据，请先返回实盘模式')
+        if self.shutdown.is_set() or (generation is not None and generation != self.demo_generation):
+            raise ValueError('板块取数已取消，请重新操作')
+        if self._auction_priority():
+            raise ValueError('09:10–09:26 优先竞价，板块联网取数请在09:27后进行')
+
+    def _sector_catalog(self, generation):
+        self._sector_guard(generation)
+        with self.sector_catalog_lock:
+            self._sector_guard(generation)
+            if self.sector_catalog and time.monotonic() - self.sector_catalog_at < 900:
+                return copy.deepcopy(self.sector_catalog)
+            def stopped():
+                return self.shutdown.is_set() or self.mode != 'live' or generation != self.demo_generation or self._auction_priority()
+            rows = load_catalog(self._provider(), should_stop=stopped)
+            self._sector_guard(generation)
+            self.sector_catalog = rows
+            self.sector_catalog_at = time.monotonic()
+            return copy.deepcopy(rows)
+
+    def search_sectors(self, query):
+        # Validate before network access. Catalog is cached; never used by polling.
+        if not isinstance(query, str) or not query.strip() or len(query) > 80:
+            raise ValueError('请输入 1—80 字的板块名称或完整指数代码')
+        return search_catalog(self._sector_catalog(self.demo_generation), query)
+
+    def _sector_report(self, date, review_id):
+        report = self.saved_report(valid_date(date))
+        if report.get('mode', 'live') != 'live' or self.mode != 'live':
+            raise ValueError('板块取数需要真实收盘报告')
+        if not review_id or report_identity(report) != review_id:
+            raise ValueError('报告已经更新，请刷新页面后再读取板块数据')
+        return report
+
+    def sector_research_result(self, date, review_id):
+        self._sector_report(date, review_id)
+        result = self.sector_library.latest(date, review_id)
+        with self.lock:
+            if self._review_identity() == review_id:
+                self.sector_summary = {k:result.get(k) for k in
+                    ('evidence_id','date','review_id','status','generated_at')}
+        return self._public_report(result)
+
+    def _fetch_sectors(self, codes, report, review_id, generation, job):
+        self._sector_guard(generation)
+        if not self.sector_fetch_lock.acquire(blocking=False):
+            raise ValueError('已有板块取数正在运行，请等待完成')
+        try:
+            catalog = self._sector_catalog(generation)
+            def stopped():
+                return self.shutdown.is_set() or self.mode != 'live' or generation != self.demo_generation or self._auction_priority()
+            evidence = build_sector_research(self._provider(), codes, report['date'], report=report,
+                catalog=catalog, now=now_sh(), should_stop=stopped,
+                progress=lambda message:self._progress(job, message))
+            self._sector_guard(generation)
+            # Retain source evidence under the captured version, never mutate it.
+            evidence = self.sector_library.save(dict(evidence, review_id=review_id))
+            with self.lock:
+                if self._review_identity() == review_id:
+                    self.sector_summary = {k:evidence.get(k) for k in
+                        ('evidence_id','date','review_id','status','generated_at')}
+            self.touch()
+            return self._public_report(evidence)
+        finally:
+            self.sector_fetch_lock.release()
+
+    def run_sector_research(self, codes, date, review_id):
+        self._sector_guard()
+        codes = validate_sector_codes(codes)
+        report = self._sector_report(date, review_id)
+        generation = self.demo_generation
+        return self._job('sectors', lambda:self._fetch_sectors(codes, report, review_id, generation, 'sectors'))
+
+    def run_llm(self, question='', provider=None, review_date=None, review_id=None,
+                sector_codes=None, fetch_sectors=False):
+        if not isinstance(fetch_sectors, bool):
+            raise ValueError('是否联网取数必须为 true 或 false')
+        if sector_codes is not None and not fetch_sectors:
+            raise ValueError('指定板块后请使用联网取数并 AI 分析')
+        if fetch_sectors:
+            self._sector_guard()
+            sector_codes = validate_sector_codes(sector_codes)
+            self._sector_report(review_date, review_id)
         state = self.snapshot()
         generation = self.demo_generation
         config = copy.deepcopy(load_llm(provider) if provider is not None else load_llm())
+        if fetch_sectors and not config.get('api_key'):
+            raise ValueError('请先配置所选 AI 服务商的 Key，或使用“只读取板块数据”')
         provider = config.get('provider', 'custom')
         scope = 'market'
         captured_review_id = None
@@ -937,10 +1033,23 @@ class Service:
             raise ValueError('还没有可分析的数据，请先采集或生成复盘')
         def work():
             from .llm import analyze
+            evidence = None
+            if fetch_sectors:
+                evidence = self._fetch_sectors(sector_codes, report, captured_review_id, generation, 'llm')
+                self._sector_guard(generation)
+                self._sector_report(review_date, captured_review_id)
+                if evidence.get('status') == 'unavailable' or not evidence.get('boards'):
+                    raise ValueError('指定板块未取得有效证据，未调用 AI；请查看取数提示后重试')
+                state['sector_research'] = evidence
+                self._progress('llm', '板块证据已保存，正在调用所选 AI 分析')
             result = analyze(config, state, question)
             record = {'text':result, 'generated_at':now_sh().isoformat(),'mode':state['mode'],
                       'provider':provider, 'label':config.get('label'), 'model':config.get('model'),
-                      'scope':scope, 'review_date':review_date, 'review_id':captured_review_id}
+                      'scope':scope, 'review_date':review_date, 'review_id':captured_review_id,
+                      'question':str(question)[:2000]}
+            if evidence:
+                record.update(sector_codes=sector_codes, sector_evidence_id=evidence['evidence_id'],
+                    sector_generated_at=evidence.get('generated_at'))
             with self.lock:
                 if generation != self.demo_generation or self.mode != state['mode']:
                     return

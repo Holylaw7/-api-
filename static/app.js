@@ -26,6 +26,7 @@
   };
   const dateAtShanghai = () => new Intl.DateTimeFormat('en-CA', {timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
   const state = {snapshot: null, selected: null, filter: 'all', search: '', page: 'auction', history: [], historyKey: '', historyLastFetch: 0, historyBusy: false, connected: false, configLoaded: false, reportSignature: '', reviewDateTouched: false, watchlistSettingsDirty: false, queryRequested: '', llmProvider: '', llmDirty: false, llmSignature: '', llmSwitching: false, reports: [], reportsBusy: false, reportsMode: '', reportsGeneration: 0, reportSaveBusy: false, reportLoadBusy: false, comparisonBusy: false, comparisonGeneration: 0, diagnosticsBusy: false, diagnosticsLoaded: false};
+  Object.assign(state, {sectorSelection: [], sectorMatches: [], sectorSearchBusy: false, sectorFetchBusy: false, sectorCacheBusy: false, sectorEvidence: null, sectorSyncKey: '', sectorPreviewSignature: '', sectorSearchMessage: '', sectorError: ''});
   let pollTimer = null;
   let polling = false;
   const factors = {
@@ -221,6 +222,7 @@
     if (state.reportsMode !== snapshot.mode) loadReports();
     if (!state.diagnosticsLoaded) loadDiagnostics();
     renderLLM(snapshot.llm || {}, snapshot.jobs?.llm);
+    syncSectorResearch();
     renderErrors(snapshot);
     if (!state.reviewDateTouched) {
       const dates = list(snapshot.calendar?.dates || snapshot.calendar).filter((day) => day < dateAtShanghai() || (day === dateAtShanghai() && seconds >= 54000));
@@ -1135,6 +1137,211 @@
     $('review-trend').innerHTML = `<div class="trend-fact"><span>昨日涨停今日晋级</span><strong>${esc(num(promotion.promoted_count, 0))} / ${esc(num(promotion.previous_count, 0))}</strong></div><div class="trend-fact"><span>涨停延续率</span><strong>${numeric(promotion.rate_pct) ? `${esc(num(promotion.rate_pct, 1))}%` : '—'}</strong></div>${chart}${recent.length ? '<h3 class="small-title">最近交易日走势</h3>' : ''}${recent.map((r) => `<div class="history-item"><span>${esc(r.date)}</span><span>涨停 ${esc(num(r.limit_up_count, 0))}</span><span>${esc(num(r.max_consecutive, 0))} 板</span></div>`).join('')}<p class="trend-note">${esc(report.ladder?.limitation || '延续率为昨日涨停股在今日继续涨停的比例。连板高度依据可用历史和官方字段，缺失项保持未知。')}</p>`;
   }
 
+  const sectorCategory = (category) => ({industry: '行业', cn_concept: '概念', concept: '概念'}[category] || category || '板块');
+  const sectorStatus = (status) => ({ready: '数据已读取', partial: '部分数据可用', unavailable: '暂无可用数据', error: '读取失败', not_run: '尚未读取'}[status] || '待核验');
+  const selectedSectorCodes = () => state.sectorSelection.map((row) => row.thscode);
+  const sameSectorCodes = (a, b) => JSON.stringify([...new Set(list(a))].sort()) === JSON.stringify([...new Set(list(b))].sort());
+  const stockCodeButton = (code, name, date) => datedStockButton(code, date, name);
+
+  function sectorBlockedReason(requireReport = true) {
+    const snapshot = state.snapshot || {};
+    if (snapshot.mode !== 'live' || snapshot.review?.mode === 'demo') return '请切换到实盘模式后查询同花顺板块。';
+    if (!snapshot.configured) return '请先在「策略与接入」配置行情 API Key。';
+    if (requireReport && (!snapshot.review?.date || !snapshot.review_id)) return '请先生成或读取一份已收盘的真实报告。';
+    const stamp = new Date(snapshot.now || Date.now()).getTime() + Math.max(0, Date.now() - (state.snapshotReceivedAt || Date.now()));
+    const hhmm = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false}).format(new Date(stamp));
+    if (hhmm >= '09:10' && hhmm <= '09:26') return '09:10—09:26 优先竞价；09:27 后可联网查询，已保存数据仍可查看。';
+    if (snapshot.api?.rate_limited && (state.apiCooldownDeadline || 0) > Date.now()) return '行情接口正在限流冷却，请在冷却结束后读取。';
+    if (snapshot.jobs?.review?.status === 'running' || snapshot.jobs?.evidence?.status === 'running') return '报告正在更新，完成后再读取对应版本的板块数据。';
+    if (state.sectorFetchBusy || snapshot.jobs?.sectors?.status === 'running') return '正在读取指定板块，请等待任务完成。';
+    if (snapshot.jobs?.llm?.status === 'running') return 'AI 正在处理已提交的内容，请等待本次完成。';
+    return '';
+  }
+
+  function renderSectorChoices() {
+    const selected = new Set(selectedSectorCodes());
+    $('sector-search-results').innerHTML = state.sectorMatches.map((row) => `<button type="button" class="sector-choice${selected.has(row.thscode) ? ' selected' : ''}" data-sector-select="${esc(row.thscode)}" aria-pressed="${selected.has(row.thscode)}"><strong>${esc(row.name || row.thscode)}</strong><span>${esc(row.thscode)} · ${esc(sectorCategory(row.category))}</span><small>${selected.has(row.thscode) ? '已选择 ✓' : '选择 ＋'}</small></button>`).join('');
+    $('sector-selected').innerHTML = state.sectorSelection.length ? state.sectorSelection.map((row) => `<button type="button" class="sector-selected-chip" data-sector-remove="${esc(row.thscode)}" aria-label="移除 ${esc(row.name || row.thscode)}"><span>${esc(row.name || row.thscode)} <small>${esc(row.thscode)}</small></span><b aria-hidden="true">×</b></button>`).join('') : '<span class="subtle">尚未选择</span>';
+  }
+
+  function renderSectorControls() {
+    const snapshot = state.snapshot || {};
+    const selected = state.sectorSelection.length > 0;
+    const reason = sectorBlockedReason();
+    const searchReason = sectorBlockedReason(false);
+    const job = snapshot.jobs?.sectors || {};
+    const llmBusy = snapshot.jobs?.llm?.status === 'running';
+    text('sector-research-date', snapshot.review?.date ? `数据目标日 ${snapshot.review.date}` : '等待收盘报告');
+    $('sector-search-button').disabled = Boolean(state.sectorSearchBusy || searchReason);
+    $('sector-search-button').title = searchReason || '查询同花顺官方目录，不调用模型。';
+    text('sector-search-button', state.sectorSearchBusy ? '正在搜索…' : '搜索板块');
+    text('sector-search-status', state.sectorSearchBusy ? '正在读取官方板块目录…' : state.sectorSearchMessage || searchReason || '输入名称后查看官方匹配项，再选择需要读取的板块。没有匹配项时不会猜测其他板块。');
+    $('sector-fetch').disabled = Boolean(reason || !selected || state.sectorSearchBusy);
+    $('sector-fetch').title = reason || (!selected ? '先搜索并选择板块。' : '只请求行情数据，不调用 AI。');
+    text('sector-fetch', state.sectorFetchBusy || job.status === 'running' ? '正在读取板块…' : '只读取板块数据');
+    $('sector-cache-refresh').disabled = Boolean(state.sectorCacheBusy || snapshot.mode !== 'live' || !snapshot.review_id);
+    const status = state.sectorError || (job.status === 'error' ? `最近一次板块查询未完成：${job.message || '请检查接口后重试。'} 已保存的旧数据仍保留。` : job.status === 'running' ? job.message || '正在读取板块及同行数据，完成后自动展示。' : reason || (state.sectorEvidence?.evidence_id ? '下方为已保存的板块证据；重新取数会生成新的证据版本，已有 AI 回答不会自动更新。' : '按当前报告日期读取指定板块与同行；可只读数据，也可点击右上方按钮一次取数并分析。'));
+    text('sector-job-status', status);
+    $('sector-job-status').classList.toggle('warn', Boolean(state.sectorError) || job.status === 'error');
+    $('llm-generate').disabled = Boolean(llmBusy || state.llmSubmitBusy || (selected && (reason || state.sectorSearchBusy)));
+    $('llm-generate').title = selected ? reason || '先读取所选板块，再发送给当前 AI；本次会调用模型。' : '发送已有结构化摘要给所选 AI。';
+    text('llm-generate', llmBusy || state.llmSubmitBusy ? '正在分析…' : selected ? '联网取数并 AI 分析 ↗' : '生成文字分析 ↗');
+  }
+
+  async function searchSectors(event) {
+    event.preventDefault();
+    const reason = sectorBlockedReason(false);
+    if (reason || state.sectorSearchBusy) { if (reason) toast(reason); return; }
+    const query = $('sector-query').value.trim();
+    if (!query) { toast('请输入板块名称或完整板块代码。'); $('sector-query').focus(); return; }
+    state.sectorSearchBusy = true;
+    state.sectorMatches = [];
+    state.sectorSearchMessage = '';
+    renderSectorChoices(); renderSectorControls();
+    try {
+      const result = await api('/api/sectors/search', {query});
+      if (state.snapshot?.mode !== 'live') return;
+      const seen = new Set();
+      state.sectorMatches = list(result.matches).filter((row) => row && typeof row.thscode === 'string' && !seen.has(row.thscode) && seen.add(row.thscode));
+      const exact = list(result.exact);
+      state.sectorSearchMessage = result.message || (state.sectorMatches.length ? `找到 ${state.sectorMatches.length} 个匹配项${exact.length ? `，其中 ${exact.length} 个为精确匹配` : '，没有精确同名项'}。请核对名称后选择，最多 3 个。` : `官方目录没有找到「${query}」。可使用官网目录中的名称或完整代码；不会自动用其他板块替代。`);
+    } catch (error) { state.sectorSearchMessage = `搜索未完成：${error.message}`; toast(error.message, true); }
+    finally { state.sectorSearchBusy = false; renderSectorChoices(); renderSectorControls(); }
+  }
+
+  function toggleSector(code, remove = false) {
+    const index = state.sectorSelection.findIndex((row) => row.thscode === code);
+    if (index >= 0) state.sectorSelection.splice(index, 1);
+    else if (!remove) {
+      const row = state.sectorMatches.find((item) => item.thscode === code);
+      if (!row) return;
+      if (state.sectorSelection.length >= 3) { toast('每次最多选择 3 个板块，请先移除一个。'); return; }
+      state.sectorSelection.push({thscode: row.thscode, name: row.name, category: row.category});
+    }
+    renderSectorChoices(); renderSectorControls(); renderSectorEvidence();
+    renderLLM(state.snapshot?.llm || {}, state.snapshot?.jobs?.llm);
+  }
+
+  async function fetchSectors() {
+    const reason = sectorBlockedReason();
+    if (reason || !state.sectorSelection.length) { toast(reason || '请先选择板块。'); return; }
+    const body = {codes: selectedSectorCodes(), date: state.snapshot.review.date, review_id: state.snapshot.review_id};
+    state.sectorFetchBusy = true; state.sectorError = ''; renderSectorControls();
+    try {
+      const result = await api('/api/sectors/research', body);
+      toast(result.message || '板块数据读取已提交；不调用 AI。');
+      await fetchState();
+    } catch (error) { state.sectorError = `本次板块读取未提交：${error.message}`; toast(error.message, true); }
+    finally { state.sectorFetchBusy = false; renderSectorControls(); }
+  }
+
+  async function loadSectorEvidence(force = false) {
+    const snapshot = state.snapshot || {};
+    if (snapshot.mode !== 'live' || !snapshot.review?.date || !snapshot.review_id) return;
+    const reportKey = displayedReportKey();
+    const requestKey = `${reportKey}|${snapshot.sector_research?.evidence_id || ''}|${snapshot.jobs?.sectors?.status || ''}|${snapshot.jobs?.llm?.status || ''}`;
+    if (!force && requestKey === state.sectorSyncKey) return;
+    state.sectorSyncKey = requestKey;
+    const generation = state.sectorCacheGeneration = (state.sectorCacheGeneration || 0) + 1;
+    state.sectorCacheBusy = true;
+    renderSectorControls();
+    try {
+      const query = new URLSearchParams({date: snapshot.review.date, review_id: snapshot.review_id});
+      const evidence = await api(`/api/sectors/research?${query}`);
+      if (generation !== state.sectorCacheGeneration || reportKey !== displayedReportKey()) return;
+      if (evidence.status === 'not_run') state.sectorEvidence = null;
+      else if (evidence.date === snapshot.review.date && evidence.review_id === snapshot.review_id) state.sectorEvidence = evidence;
+      else throw new Error('板块证据日期或报告版本不匹配，未展示。');
+      state.sectorError = '';
+      renderSectorEvidence();
+      renderLLM(state.snapshot?.llm || {}, state.snapshot?.jobs?.llm);
+    } catch (error) { if (generation === state.sectorCacheGeneration && reportKey === displayedReportKey()) state.sectorError = `读取已保存板块数据失败：${error.message}`; }
+    finally { if (generation === state.sectorCacheGeneration) { state.sectorCacheBusy = false; renderSectorControls(); } }
+  }
+
+  function syncSectorResearch() {
+    const reportKey = displayedReportKey();
+    if (state.sectorReportKey !== reportKey) {
+      state.sectorReportKey = reportKey;
+      state.sectorEvidence = null;
+      state.sectorError = '';
+      state.sectorSyncKey = '';
+      state.sectorCacheGeneration = (state.sectorCacheGeneration || 0) + 1;
+      state.sectorCacheBusy = false;
+      renderSectorEvidence();
+    }
+    if (state.snapshot?.mode === 'demo') {
+      state.sectorMatches = []; state.sectorSelection = [];
+      state.sectorSearchMessage = ''; renderSectorChoices();
+    }
+    renderSectorControls();
+    loadSectorEvidence();
+  }
+
+  function renderSectorEvidence() {
+    const evidence = state.sectorEvidence;
+    const exportLink = $('sector-export');
+    const downloadable = Boolean(evidence?.evidence_id && /^[a-f0-9]{24}$/.test(evidence.evidence_id));
+    if (downloadable) exportLink.href = `/api/sectors/export?${new URLSearchParams({evidence_id: evidence.evidence_id})}`;
+    else exportLink.removeAttribute('href');
+    exportLink.classList.toggle('disabled-link', !downloadable);
+    exportLink.setAttribute('aria-disabled', String(!downloadable));
+    const signature = JSON.stringify([evidence, selectedSectorCodes()]);
+    if (signature === state.sectorPreviewSignature) return;
+    state.sectorPreviewSignature = signature;
+    if (!evidence) { $('sector-evidence-preview').innerHTML = ''; return; }
+    const boards = list(evidence.boards);
+    const selectedMismatch = state.sectorSelection.length && !sameSectorCodes(selectedSectorCodes(), boards.map((board) => board.thscode));
+    const warnings = list(evidence.warnings);
+    $('sector-evidence-preview').innerHTML = `<div class="sector-evidence-header"><strong>已保存证据 · ${esc(evidence.date)}</strong><span>${esc(sectorStatus(evidence.status))} · ${esc(time(evidence.generated_at, true))}</span></div>${selectedMismatch ? '<p class="sector-research-note warn">下方数据属于上次读取的板块，与当前选择不同。点击读取后才会更新。</p>' : ''}${boards.map((board) => {
+      const coverage = board.coverage || {};
+      const statistics = board.statistics || {};
+      const trend = board.price_trend || {};
+      const members = list(board.members).slice(0, 20);
+      const limitUps = list(board.limit_up_members);
+      const boardWarnings = list(board.warnings);
+      const noLimitUps = coverage.limit_pool_complete === true && coverage.membership_complete === true
+        ? '当前完整成分名单与该日完整涨停池未发现匹配项。'
+        : '涨停池或成分证据不完整，不能认定没有涨停股。';
+      const memberTable = members.length ? `<div class="table-scroll"><table class="data-table sector-members-table"><thead><tr><th>同行股票</th><th>目标日涨幅</th><th>成交额</th><th>当日涨停</th><th>连续板数</th><th>数据情况</th></tr></thead><tbody>${members.map((row) => `<tr><td>${stockCodeButton(row.thscode, row.name, evidence.date)}</td><td class="${tone(row.price_change_ratio_pct)}">${esc(percent(row.price_change_ratio_pct))}</td><td>${esc(amount(row.turnover))}</td><td>${row.limit_up === true ? '是' : row.limit_up === false ? '否' : '未知'}</td><td>${numeric(row.consecutive_days) ? `${row.consecutive_lower_bound ? '≥' : ''}${esc(num(row.consecutive_days, 0))}` : '—'}</td><td><span class="subtle">${esc(row.date_verified === true ? '日期已核验' : '日期待核验')}${row.data_status && row.data_status !== 'ready' ? ` · ${esc(row.data_status === 'partial' ? '部分缺失' : row.data_status === 'unavailable' ? '无可用行情' : row.data_status)}` : ''}</span></td></tr>`).join('')}</tbody></table></div>` : '<p class="sector-research-note">暂无可展示同行行情，缺失不当作零涨幅或零成交额。</p>';
+      return `<article class="sector-evidence-card"><div class="sector-board-heading"><div><strong>${esc(board.name || board.thscode)}</strong><span>${esc(board.thscode)} · ${esc(sectorCategory(board.category))}</span></div><span class="pill ${board.status === 'ready' ? 'green' : 'amber'}">${esc(sectorStatus(board.status))}</span></div><div class="sector-board-metrics"><div><span>当前成分总数</span><strong>${esc(num(board.member_count, 0))}</strong></div><div><span>同行行情覆盖</span><strong>${esc(num(coverage.quoted_count, 0))} / ${esc(num(coverage.requested_count, 0))}</strong><small>全体覆盖 ${numeric(coverage.quote_coverage_pct) ? `${esc(num(coverage.quote_coverage_pct, 1))}%` : '未知'}</small></div><div><span>目标日涨停 / 连板</span><strong>${esc(num(statistics.limit_up_count, 0))} / ${esc(num(statistics.consecutive_count, 0))}</strong></div><div><span>板块指数近 5 日</span><strong class="${tone(trend.return_5d_pct)}">${esc(percent(trend.return_5d_pct))}</strong></div></div><p class="sector-research-note">同行有效涨幅 ${esc(num(statistics.valid_change_count, 0))} 只：上涨 ${esc(num(statistics.advancing, 0))} / 下跌 ${esc(num(statistics.declining, 0))} / 平盘 ${esc(num(statistics.unchanged, 0))}；样本均值 ${esc(percent(statistics.mean_change_pct))}，中位数 ${esc(percent(statistics.median_change_pct))}。已知成交额合计 ${esc(amount(statistics.turnover_sum))}（${esc(num(statistics.turnover_known_count, 0))} 只）；主力净流入：未提供。</p><p class="sector-research-note warn">成分依据：当前名单，读取于 ${esc(time(board.members_as_of, true))}；不证明 ${esc(evidence.date)} 当时的历史归属。行情为有限样本${board.quote_scope?.selection === 'code_order' ? '，按代码顺序读取' : ''}。</p>${limitUps.length ? `<div class="sector-limit-up-list"><span>当前成分中，目标日涨停的股票</span><div class="research-codes">${limitUps.slice(0, 20).map((row) => stockCodeButton(row.thscode, row.name, evidence.date)).join('')}</div>${limitUps.length > 20 || coverage.limit_up_truncated ? '<small>名单在此截取展示，不能以未展示推断未涨停。</small>' : ''}</div>` : `<p class="sector-research-note">${esc(noLimitUps)}</p>`}<details class="sector-members"><summary>查看同行明细 · 展示 ${members.length} 只${list(board.members).length > 20 || coverage.truncated ? '（已截取）' : ''}</summary>${memberTable}</details>${boardWarnings.length ? `<div class="research-warnings"><details><summary>数据边界与缺失说明（${boardWarnings.length}）</summary><ul>${boardWarnings.map((warning) => `<li>${esc(warning)}</li>`).join('')}</ul></details></div>` : ''}</article>`;
+    }).join('')}${warnings.length ? `<div class="research-warnings"><ul>${warnings.map((warning) => `<li>${esc(warning)}</li>`).join('')}</ul></div>` : ''}<p class="sector-research-note">来源：同花顺金融 API。以上为指定板块证据，尚不表示已生成新的 AI 回答；模型使用的证据见回答前的说明。</p>`;
+  }
+
+  function renderLLMSource(result, job) {
+    let message = '尚未生成 AI 回答。输入问题、选择板块不会自动调用模型。';
+    let warning = false;
+    if (job?.status === 'running' || state.llmSubmitBusy) message = '正在处理已提交的提问和板块选择；完成后显示本次使用的数据来源。';
+    else if (result && typeof result === 'object') {
+      const resultCodes = list(result.sector_codes);
+      message = result.sector_evidence_id ? `本回答已使用同花顺指定板块证据：${resultCodes.join('、') || '代码未标注'} · 目标日 ${result.review_date || '未标注'}${result.sector_generated_at ? ` · 取数 ${time(result.sector_generated_at, true)}` : ''}。` : '本回答使用原有结构化摘要，没有读取本次指定板块的完整证据。';
+      if (!sameSectorCodes(resultCodes, selectedSectorCodes())) { message += ' 当前所选板块与这份回答不同，需重新点击分析。'; warning = true; }
+      if (result.question !== undefined && String(result.question) !== $('llm-question').value.trim()) { message += ' 输入框提问已变化，已有回答不会随之更新。'; warning = true; }
+      if (state.sectorEvidence?.evidence_id && result.sector_evidence_id && state.sectorEvidence.evidence_id !== result.sector_evidence_id) { message += ' 下方板块预览已经更新；这份回答仍基于先前证据。'; warning = true; }
+      if (result.scope === 'review' && !matchingReviewAI()) { message += ' 回答属于其他报告日期或版本。'; warning = true; }
+    }
+    text('llm-source-status', message);
+    $('llm-source-status').classList.toggle('warn', warning);
+  }
+
+  async function submitLLM() {
+    if (state.llmSubmitBusy || state.snapshot?.jobs?.llm?.status === 'running') return;
+    if (!state.snapshot?.llm?.configured) { showPage('settings'); toast('请先保存 AI 接口与模型。', true); return; }
+    if (!state.snapshot?.review && !list(state.snapshot?.auction?.rows).length && !state.snapshot?.stocks?.analysis) { toast('请先采集竞价数据、查询个股或生成收盘复盘报告。', true); return; }
+    const codes = selectedSectorCodes();
+    const reason = codes.length ? sectorBlockedReason() : '';
+    if (reason) { toast(reason); return; }
+    const body = {question: $('llm-question').value.trim(), provider: state.llmProvider, ...(state.snapshot?.review?.date ? {review_date: state.snapshot.review.date, review_id: state.snapshot.review_id} : {}), ...(codes.length ? {sector_codes: codes, fetch_sectors: true} : {})};
+    state.llmSubmitBusy = true; state.sectorError = ''; renderSectorControls();
+    renderLLMSource(state.snapshot?.llm?.result, state.snapshot?.jobs?.llm);
+    try {
+      const result = await api('/api/llm', body);
+      toast(result.message || (codes.length ? '已提交：先读取指定板块，再调用所选 AI。' : '已提交 AI 分析。'));
+      await fetchState();
+    } catch (error) { toast(error.message, true); }
+    finally { state.llmSubmitBusy = false; renderSectorControls(); renderLLM(state.snapshot?.llm || {}, state.snapshot?.jobs?.llm); }
+  }
+
   function renderLLMConfig(llm, jobs) {
     const profiles = list(llm.profiles);
     const active = llm.active_provider || 'custom';
@@ -1186,6 +1393,7 @@
 
   function renderLLM(llm, job) {
     const result = llm.result;
+    renderLLMSource(result, job);
     let output;
     if (job?.status === 'running') output = job.message || 'AI 正在分析复盘报告，请稍候…';
     else if (llm.error || job?.status === 'error') output = `AI 分析失败：${llm.error || job.message}`;
@@ -1213,6 +1421,7 @@
     text('api-cooldown-text', remaining > 0 ? `约 ${num(remaining, 0)} 秒后可恢复请求；同一 Key 的后台请求同步暂停，已有观测继续保留。` : '冷却时间已到，等待服务确认；已有观测继续保留。');
     renderOfficialControls();
     renderBacktestControls();
+    renderSectorControls();
     text('clock', time(new Date().toISOString()));
     const auction = state.snapshot?.auction || {};
     const latest = auction.summary?.last_received_at || list(auction.rows).reduce((last, row) => row.updated_at && (!last || row.updated_at > last) ? row.updated_at : last, '');
@@ -1262,6 +1471,10 @@
   document.addEventListener('click', async (event) => {
     const nav = event.target.closest('[data-tab],[data-open]');
     if (nav) { showPage(nav.dataset.tab || nav.dataset.open); return; }
+    const sectorSelect = event.target.closest('[data-sector-select]');
+    if (sectorSelect) { toggleSector(sectorSelect.dataset.sectorSelect); return; }
+    const sectorRemove = event.target.closest('[data-sector-remove]');
+    if (sectorRemove) { toggleSector(sectorRemove.dataset.sectorRemove, true); return; }
     const stockQuery = event.target.closest('[data-query-stock]');
     if (stockQuery) {
       if (Object.prototype.hasOwnProperty.call(stockQuery.dataset, 'queryDate')) $('stock-query-date').value = stockQuery.dataset.queryDate;
@@ -1285,9 +1498,8 @@
     const action = event.target.closest('[data-action]');
     if (!action) return;
     const name = action.dataset.action;
-    if (name === 'llm' && !state.snapshot?.llm?.configured) { showPage('settings'); toast('请先保存 AI 接口与模型。', true); return; }
-    if (name === 'llm' && !state.snapshot?.review && !list(state.snapshot?.auction?.rows).length && !state.snapshot?.stocks?.analysis) { toast('请先采集竞价数据、查询个股或生成收盘复盘报告。', true); return; }
-    const body = name === 'review' ? {date: $('review-date').value || undefined} : name === 'llm' ? {question: $('llm-question').value.trim(), provider: state.llmProvider, ...(state.snapshot?.review?.date ? {review_date: state.snapshot.review.date, review_id: state.snapshot.review_id} : {})} : {};
+    if (name === 'llm') { await submitLLM(); return; }
+    const body = name === 'review' ? {date: $('review-date').value || undefined} : {};
     await mutate(`/api/${name}`, body, {prepare: '已开始准备关注池', start: '已启动监测', stop: '已停止监测', review: '已开始生成复盘', demo: '已切换到明确标记的模拟演示', llm: '已提交 AI 分析'}[name], action);
     if (name === 'demo') showPage('auction');
   });
@@ -1296,6 +1508,11 @@
     if ((event.key === 'Enter' || event.key === ' ') && event.target.matches('[data-symbol]')) { event.preventDefault(); selectStock(event.target.dataset.symbol); }
   });
   $('symbol-search').addEventListener('input', (event) => { state.search = event.target.value.trim().toLowerCase(); renderAuction(); });
+  $('sector-search-form').addEventListener('submit', searchSectors);
+  $('sector-fetch').addEventListener('click', fetchSectors);
+  $('sector-cache-refresh').addEventListener('click', () => loadSectorEvidence(true));
+  $('llm-question').maxLength = 2000;
+  $('llm-question').addEventListener('input', () => renderLLMSource(state.snapshot?.llm?.result, state.snapshot?.jobs?.llm));
   $('watchlist').addEventListener('input', () => { state.watchlistSettingsDirty = true; });
   for (const id of ['auto-review', 'review-time']) $(id).addEventListener('input', () => {
     state.runtimeScheduleDirty = true;

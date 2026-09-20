@@ -1,4 +1,4 @@
-# 模块与接口契约 · 1.4
+# 模块与接口契约 · 1.6
 
 Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UTC+08。共享可变状态由service锁保护；密钥不进入状态、文档或测试。字段缺失保留null，调用失败与成功空列表区分。
 
@@ -20,6 +20,8 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 | `insights.py` | `compare_reports(current,previous)->dict` 两期证据比较；`readiness(snapshot,internal=None)->dict` 本机状态诊断，均无网络或磁盘 I/O、不读取系统时钟 |
 | `sentiment.py` | `build_sentiment(report)->dict` 从留存完整池计算至多10日梯队矩阵、封单留存与原因原文分布；纯计算，无外部请求 |
 | `official_context.py` | `build_official_context(provider,date,should_stop=None)->dict` 显式日期的风向标与三类龙虎榜，最多4个业务分项；分项失败隔离、原始data保存在raw |
+| `sector_research.py` | `load_catalog(provider,should_stop=None)`、`search_catalog(rows,query)`、`validate_sector_codes(values)`；`build_sector_research(provider,codes,date,report=...,catalog=None,now=None,should_stop=None,progress=None)` 有界指定板块取数，不落盘、不调用模型 |
+| `sector_library.py` | `SectorLibrary(data_dir).save/get/latest`，按证据摘要保存和校验指定板块结果，独立绑定基报告版本 |
 
 `review._price_trend`是stocks与selection共用的日线指标原语，但两模块的综合评分公式不同；不要因同名`_trend_score`而合并。竞价七因子又是独立公式，三种分数不可混排。
 
@@ -35,7 +37,7 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 
 ## HTTP
 
-GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: version`、`event: state`加JSON，重连建议为2000毫秒。状态版本变化立即推送完整状态，不等待固定刷新周期；闲时每次最长等待3秒后可发送注释keepalive，完整状态一般15秒刷新一次，09:10–09:26保护时段改为3秒，以更新时钟和陈旧提示。这是页面刷新策略，不改变竞价逐批计算或上游请求频率。GET `/api/history?symbol=完整代码`读取已有本机观察；GET `/api/health`主服务版本为1.4.0。
+GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: version`、`event: state`加JSON，重连建议为2000毫秒。状态版本变化立即推送完整状态，不等待固定刷新周期；闲时每次最长等待3秒后可发送注释keepalive，完整状态一般15秒刷新一次，09:10–09:26保护时段改为3秒，以更新时钟和陈旧提示。这是页面刷新策略，不改变竞价逐批计算或上游请求频率。GET `/api/history?symbol=完整代码`读取已有本机观察；GET `/api/health`主服务版本为1.6.0。
 
 | POST路径 | JSON请求体及作用 |
 | --- | --- |
@@ -54,7 +56,9 @@ GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: 
 | `/api/llm-config` | `{provider,model?,api_key?,base_url?}`；保存该家配置，不自动切换；缺provider兼容旧custom配置并选中 |
 | `/api/llm-select` | `{provider}`；切换deepseek/openai/custom |
 | `/api/llm-test` | `{provider?}`；后台GET模型列表检查，返回started |
-| `/api/llm` | `{question?:'...',provider?,review_date?,review_id?}`；无review_date为盘面分析，有review_date为该版本收盘报告专属分析，详见下文 |
+| `/api/llm` | `{question?:'...',provider?,review_date?,review_id?,fetch_sectors?:false,sector_codes?}`；指定板块组合分析须fetch_sectors=true且有报告日期/版本，详见1.6契约；其余保持原摘要分析 |
+| `/api/sectors/search` | `{query:'名称或完整代码'}`；1—80字，官方行业/概念完整目录匹配，返回ok/query/matches/exact/unmatched_note |
+| `/api/sectors/research` | `{codes:[完整官方代码],date,review_id}`；1—3个唯一代码，异步取数，返回started；不调用模型 |
 
 响应为`{ok,message,...}`；review、reports/enrich、watchlist/add、stocks/analyze、trends/refresh、llm及llm-test另含started，false表示同名任务正在运行。仅允许本机Host、同源及`X-Local-App: auction-lab`。禁止GET暴露密钥、任意文件读取或向不同服务转发旧密钥。股票代码必须是字符串，保留前导零；裸代码不能仅凭已有完整代码缓存假定唯一。
 
@@ -65,6 +69,8 @@ GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: 
 | `/api/reports/compare` | `date,baseline`，均为YYYY-MM-DD且baseline更早；仅比较当前模式本机保存报告，不补请求行情 |
 | `/api/reports/download` | `filename,mode=live|demo,sha256?`；下载已保存的文件，sha256若提供必须匹配当前文件字节 |
 | `/api/diagnostics` | `{status,summary,checked_at,checks:[{id,label,status,message}]}`，status及每项status为ok/warn/error/info；只检查本机已知状态 |
+| `/api/sectors/research` | `date,review_id`；返回对应有效基报告版本最近一次板块证据或status=not_run，不联网 |
+| `/api/sectors/export` | `evidence_id`；按24位小写十六进制编号校验并下载证据JSON，不接受路径 |
 
 `/api/reports/save`成功返回`{ok,message,path,filename,date,mode,review_id,sha256,download_url}`。前端使用服务返回的download_url取得本次保存的同一内容，不自行拼路径。文件在点击后又被重新生成或保存覆盖时，带旧sha256的下载必须失败并要求重新保存；校验值不是访问凭据。API日期须严格匹配有效YYYY-MM-DD，不接收任意路径。文件名只允许`YYYY-MM-DD.md`或`YYYY-MM-DD-with-ai-{deepseek|openai|custom}.md`；实盘目录`data/reports/`，演示目录`data/reports/demo/`。Markdown读取上限4,000,000字节，JSON文件回退读取上限64,000,000字节。
 
@@ -78,12 +84,13 @@ state = {
           cycle_seconds,last_batch_ms,finalized,final_count,coverage,source_counts},
  stocks:{query_code,analysis,watchlist,trend_pool},
  review:null|report, review_id:null|sha256, review_sentiment:null|sentiment,
+ sector_research:{evidence_id,date,review_id,status,generated_at}|{},
  api:{rate_limited:boolean,cooldown_seconds:number}, jobs:{}, config:publicConfig,
  llm:{active_provider,profiles,configured,base_url,model,label,result,connection_test},errors:[]
 }
 ```
 
-公开calendar.dates只显示最近15个交易日，不能当作筛选/均线所需完整日历。jobs以prepare/review/evidence/llm/llm_test/stock/watchlist/trends为键，值为`{status:'running'|'done'|'error',message}`。job完成不代表日线已生成：保护时段analysis.status可以为deferred。api冷却为本机已知的剩余等待，不代表外部服务保证恢复时间。
+公开calendar.dates只显示最近15个交易日，不能当作筛选/均线所需完整日历。jobs以prepare/review/evidence/sectors/llm/llm_test/stock/watchlist/trends等为键，值为`{status:'running'|'done'|'error',message}`。job完成不代表数据完整：板块证据可为partial/unavailable，保护时段个股analysis.status可以为deferred。api冷却为本机已知的剩余等待，不代表外部服务保证恢复时间。
 
 竞价rows含`rank,thscode,name,score,factors,quality,auction_pct,auction_amount,updated_at,phase,sources`；公开状态去掉raw和大体积历史，详细本机轨迹另取。
 
@@ -99,7 +106,7 @@ state = {
 
 `review`是用户当前查看的报告；内部`latest_review`是自动复盘与趋势刷新所依据的最新实盘报告。读取历史只切换review并设置viewing_archive，不能改变latest_review。自动复盘更新latest_review和存储，但用户查看历史时不强行跳转；手动生成完成会切换至新报告。自动任务不能因历史视图日期较旧就重复生成当日报告。
 
-AI结果为`{text,generated_at,mode,provider,label,model,scope,review_date,review_id}`。`scope='market'`可含当前竞价和个股摘要，不可作为某天报告附录；`scope='review'`只发送指定报告白名单摘要，竞价为空且phase=not_included，个股分析为空。提交时固定服务商/配置/报告版本。按`data/ai-reviews/{live|demo}/YYYY-MM-DD-{provider}.json`原子归档，只写结果白名单，不包含配置或凭据；读取上限1,000,000字节。恢复或附录必须同时匹配scope、mode、review_date、review_id、provider。用户切换历史视图后，旧在途报告AI可保留其独立归档，但不得显示到另一报告下；模式改变则丢弃结果。同日同服务商归档保存最近一次结果，版本不匹配不得沿用。
+AI结果为`{text,generated_at,mode,provider,label,model,scope,review_date,review_id,question}`，1.6指定板块另含`sector_codes/sector_evidence_id/sector_generated_at`。question最多2000字符。`scope='market'`可含当前竞价和个股摘要，不可作为某天报告附录；`scope='review'`发送指定报告白名单摘要，可加显式请求的同日板块证据，竞价为空且phase=not_included，个股分析为空。提交时固定服务商/配置/报告版本。按`data/ai-reviews/{live|demo}/YYYY-MM-DD-{provider}.json`原子归档，只写结果白名单，不包含配置或凭据；读取上限1,000,000字节。恢复或附录必须同时匹配scope、mode、review_date、review_id、provider。用户切换历史视图后，旧在途报告AI可保留其独立归档，但不得显示到另一报告下；模式改变则丢弃结果。同日同服务商归档保存最近一次结果，版本不匹配不得沿用。
 
 两期比较主要结构：
 
@@ -182,6 +189,16 @@ all/org的coverage按`scope='stock_items'`核对声明总条数与实际行数�
 Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summary`导出`sentiment`和`official_observations`显式白名单，不发送raw；每榜每区间进一步限10条，保留真实总数与截取提示。原有DeepSeek/OpenAI/custom服务商隔离、版本绑定和用户主动发送规则继续适用。
 
 `HiThinkProvider.rate_limit_status()->{rate_limited,cooldown_seconds}`只读本机状态；`APIError.retry_after_seconds`是安全数值元信息。同进程同Key的实例共享429/4001冷却，冷却中请求快速返回受控错误。常规重试尊重可解析的Retry-After；要求等待超过15秒时不截短后立即重试，而交给调用方稍后处理。竞价仍每批单次HTTP尝试。该兼容机制不表示官网保证提供Retry-After，也不保证特定吞吐或恢复时效。
+
+## 指定板块证据与模型组合任务（1.6）
+
+完整字段、示例和业务上限见 [docs/SECTOR_RESEARCH.md](docs/SECTOR_RESEARCH.md)。取数须live、官方日历确认已收盘、当日达到15:10，并绑定所选报告的有效`review_id`。`fetch_sectors`须JSON布尔值；携带`sector_codes`但未开启取数时拒绝。组合任务先检查模型Key存在，再读取官方数据；全无有效证据时归档unavailable但不调用模型，部分有效则携带缺失继续。
+
+行业和概念目录各全量读取，主进程缓存15分钟；代码须匹配该官方目录，纯代码、未知代码及重复选择拒绝，不根据别名猜映射。每次最多3板块，最新报价合并最多300代码、每批100；历史行情每板按代码顺序最多20，合并最多60个短日线请求。构建最多10次最近日或67次历史日业务调用，目录未命中另2次，provider重试另计。每次请求前后检查保护/取消，09:10–09:26不开始新的板块联网任务，竞价每批流程不调用该模块。
+
+结果含`date/mode/review_id/evidence_id/generated_at/status/boards/coverage/warnings/definition`；board保留当前成员依据、取数时间、日期及行情覆盖、指数趋势、样本统计、同行明细和涨停交集。当前成员不是历史组成；快照不能替代旧日行情；完整收盘池缺失时涨停未知；严格连板另有consecutive_known_count；net_flow保持null。JSON每板100同行/30涨停，页面20/20，LLM30/30；各层明示截断并保留统计原分母。模型经独立分层白名单`targeted_sectors`接收所选板块，不受`sectors_top30`排除。
+
+`SectorLibrary`保存`data/sector-research/evidence/<id>.json`及`latest/<date>-<review_id>.json`指针。id为证据（排除自身id）的规范JSON SHA-256前24个十六进制字符，包含取数时间；校验读取上限8MiB。基报告对象及其review_id不变，旧证据可按id审计；不将新数据原地附加进基报告。报告重新生成后，原证据不自动成为新版本证据。模型发起前再次确认版本，AI附录保留问题、代码、证据编号与时间且全部转义。独立助手不因聊天或加载摘要隐式访问金融API。
 
 ## 持久化与维护
 

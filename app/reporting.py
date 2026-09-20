@@ -185,6 +185,14 @@ def _ai_lines(report, ai):
     lines = ['', '## AI 辅助研判（对应本报告版本）', '',
              f"服务商：{_text(ai.get('label') or ai.get('provider'))}；模型：{_text(ai.get('model'))}；生成时间：{_text(ai.get('generated_at'))}。", '',
              '以下是模型解释，尚未独立验证；不修改上述数据、评分或数据边界。', '']
+    if isinstance(ai.get('question'), str) and ai['question'].strip():
+        lines += [f"本次问题：{_text(ai['question'][:2000])}", '']
+    if ai.get('sector_evidence_id'):
+        codes = ai.get('sector_codes')
+        codes = [code for code in codes[:3] if isinstance(code, str)] if isinstance(codes, list) else []
+        lines += [f"指定板块补充证据编号：{_text(ai.get('sector_evidence_id'))}。",
+                  f"板块代码：{_text('、'.join(codes))}；取数时间：{_text(ai.get('sector_generated_at'))}。",
+                  '补充证据与本报告版本绑定；当前成员回看不代表历史成分，样本成交额不是净资金流。', '']
     # Treat the model output as quoted text, never executable HTML or Markdown.
     lines.extend('> ' + (_text(line) if line else '') for line in text.splitlines())
     return lines

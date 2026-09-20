@@ -132,8 +132,11 @@ class ReportLibrary:
     def save_ai(self, result):
         path = self.ai_path(result['review_date'], result['provider'], result['mode'])
         # This adapter never receives the API config or credentials.
-        fields = ('text', 'provider', 'label', 'model', 'mode', 'generated_at', 'review_date', 'review_id', 'scope')
-        atomic_text(path, json.dumps({k: result.get(k) for k in fields}, ensure_ascii=False, allow_nan=False, indent=2))
+        fields = ('text', 'provider', 'label', 'model', 'mode', 'generated_at', 'review_date', 'review_id', 'scope',
+                  'sector_evidence_id', 'sector_codes', 'sector_generated_at', 'question')
+        record = {k: result.get(k) for k in fields}
+        record['question'] = result['question'][:2000] if isinstance(result.get('question'), str) else None
+        atomic_text(path, json.dumps(record, ensure_ascii=False, allow_nan=False, indent=2))
 
     def load_ai(self, report):
         results = {}

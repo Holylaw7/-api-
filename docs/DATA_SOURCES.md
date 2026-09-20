@@ -1,12 +1,26 @@
 # 数据来源、统计口径与扩展契约
 
-适用版本：1.5。原有采集与评分口径保持兼容；1.5 增加真实历史竞价回放、每日评分核验与有来源声明的外部历史导入。1.4 的本机情绪结构、显式报告日期的风向标与龙虎榜，以及分页和限流处理继续使用。
+适用版本：1.6。新增指定官方板块与成员的有界取数和可追溯AI证据；原有采集与评分口径保持兼容。1.5历史回放、每日核验与外部导入，以及1.4情绪结构、风向标、龙虎榜、分页和限流处理继续使用。
 
 1.4 在2026-09-20重新核对用户指定的[官方完整指南 llms-full.txt](https://fuyao.aicubes.cn/llms-full.txt)、[REST 总览](https://fuyao.aicubes.cn/docs/api-reference/overview/)和[最佳实践](https://fuyao.aicubes.cn/best-practices/)。参数、字段和日期含义以现行REST契约为准；示例中的模拟数值不作为真实数据或时间规则。下方较早的仓库核对记录保留为历史背景。
 
 本系统依照 [HiThink-Tech/Financial-API 官方文档](https://github.com/HiThink-Tech/Financial-API/tree/main/docs/api)实现。开发核对日期：2026-09-19。主地址为 `https://fuyao.aicubes.cn`，认证字段为请求头 `X-api-key`。仅 `HTTP 200` **且** JSON 信封 `code == 0` 才属于成功；空数据、未就绪、权限错误、网络错误分别处理。
 
 2026-09-20 补充联网核对：[官方 README](https://github.com/HiThink-Tech/Financial-API/blob/main/README.md)已按业务域组织原子接口文档。旧聚合路径 `docs/api/endpoints-auction.md`、`docs/api/endpoints-special-data.md` 在本次访问官方 main 原始文件时返回 404，因此不以旧地址内容作依据；当前采用 [集合竞价快照](https://github.com/HiThink-Tech/Financial-API/blob/main/docs/api/a-share/auction-snapshot.md)和[涨停股票池](https://github.com/HiThink-Tech/Financial-API/blob/main/docs/api/a-share/special-data-limit-up-pool.md)等有效页面。文档变化不代表自动新增了已验证的数据能力。
+
+## 1.6 指定板块的来源与样本
+
+按 [官方指数契约](https://fuyao.aicubes.cn/docs/api-reference/a-share-index/) 核对，目录每个tag全量返回，无分页；本功能只使用`industry/cn_concept`，不启用区域和特色。搜索在完整目录中匹配名称或完整代码，不依赖原报告板块前30名。未匹配的缩写或方向不推测成另一个官方板块。主服务缓存目录15分钟，真实名称与代码以官方返回为准。
+
+当前成员接口只接受单个指数代码，没有历史date参数。`members_as_of`记录本机取回时间，不能解释为成分生效日期；`membership_basis=current_members_view`明确“当前成员在目标日的表现”。本功能不把当前成员表引入竞价历史调参或宣称无前视的历史板块回测。
+
+每板取截至目标日的60自然日指数日线，指数无复权参数，逐bar的`date_ms`核验日期。成员报价优先复用同报告合格行情；最近收盘日缺少的有限样本可补`stock_quote`，更早目标日只补官方前一交易日至目标日的前复权日线。股票与指数快照的`timestamp`是其中最新有效上游时间，不是逐股时间；采用有限休市推断时保留`provisional/date_verified=false`，不能贴成旧日已核验快照。最新快照字段含涨跌幅百分数原值、成交量股、成交额元；没有名称时使用官方成员名单名称。依据 [股票行情说明](https://fuyao.aicubes.cn/docs/api-reference/prices/)。
+
+每次最多3板块，合并最新报价最多300代码、每批100；历史同行按代码顺序每板最多20、合并最多60个短日线请求，原报告可用行情会减少请求。最近日构建最多10次、历史日最多67次业务调用，目录缓存未命中另2次；重试另计。这些是工程边界，不是官网对普通行情显式代码批量大小或刷新时效的保证。
+
+涨跌分布及成交额统计只覆盖有效行情样本；涨停聚集则以全部有效当前成员与原报告经核验的完整收盘池相交，两者分母不同。严格连板未知不填0，另给`consecutive_known_count`；成分不完整和池缺失分别提示。每板JSON最多100同行/30涨停、AI30/30、页面20/20，截断不改变底层统计分母，也不能以未展示认定未涨停。全部无有效证据时状态为unavailable并停止模型调用。
+
+补充证据独立保存在`data/sector-research/`并绑定原`review_id`，不修改原报告及原评分。模型只收`targeted_sectors`分层白名单及来源/覆盖，不收配置、Key或raw。[主力资金说明](https://fuyao.aicubes.cn/docs/api-reference/capital-flow/)仍标明未开放外部接入，`net_flow`保持null；成交额、龙虎榜净买入均不能替代整个板块净流入。详细字段与例子见 [SECTOR_RESEARCH.md](SECTOR_RESEARCH.md)。
 
 ## 1.5 历史竞价与结果标签
 
@@ -40,7 +54,7 @@
 
 `HiThinkProvider` 的公开方法为 `get`、`calendar`、`pool`、`auction`、`market`、`catalog`、`indices`、`members`、`ladder`、`tickers`、`historical` 和 `index_historical`。`get` 返回已校验信封内的 `data`，业务失败抛出 `APIError`。应用通过同一个适配器执行数据访问，便于替换数据源。
 
-版本1.1另提供 `resolve_stock(code)` 与 `stock_quote(codes)`。当前独立日线研究不调用 `stock_quote`，避免当前快照混入历史分析。
+版本1.1另提供 `resolve_stock(code)` 与 `stock_quote(codes)`。独立个股日线研究仍不调用 `stock_quote`；1.6指定板块仅为最近收盘日有限样本使用它，并严格检查日期，不用于填补更早历史。
 
 ## 代码解析、独立研究与趋势池
 
