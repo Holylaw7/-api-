@@ -1,6 +1,6 @@
 # 架构与二次开发
 
-版本1.6。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。指定板块取数见 `docs/SECTOR_RESEARCH.md`，历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
+版本1.7。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。同花顺接入见 `docs/FINANCE_CONNECTION.md`，指定板块取数见 `docs/SECTOR_RESEARCH.md`，历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
 
 ## 模块与数据流
 
@@ -69,6 +69,10 @@ research_data.py → 有界历史JSON导入 → research.py → replay.py → Au
 | 方法与路径 | 说明 |
 |---|---|
 | GET `/api/health` | 本服务识别和版本 |
+| GET `/api/finance/status` | 本机同花顺配置/验证状态，无密钥，不联网 |
+| POST `/api/finance/config` | `{api_key}`，只保存用户级Key，不启动或测试 |
+| POST `/api/finance/test` | `{}`，后台一次官方日历认证测试，结果经finance及jobs推送 |
+| POST `/api/demo/exit` | 退出演示、恢复本机live视图，不采集 |
 | GET `/api/state` | 全部页面所需公开状态，不含密钥 |
 | GET `/api/events` | `event: state` 的 Server-Sent Events，断线可重连 |
 | GET `/api/history?symbol=完整代码` | 当前会话已采集该股原始观察 |
@@ -98,6 +102,10 @@ research_data.py → 有界历史JSON导入 → research.py → replay.py → Au
 | GET `/api/sectors/export` | evidence_id；校验并下载独立证据JSON |
 
 所有 POST 要求同源及 `X-Local-App: auction-lab`；请求 Host 必须是本机服务地址，降低跨站和 DNS 重绑定风险。GET 不回显凭据。静态文件是白名单，不能下载 SQLite、Python 源码或凭据。远程 LLM 强制 HTTPS，重定向禁止转发 Key。
+
+1.7的网页接入流程为保存→显式测试→按需启动。`finance`是独立状态对象，configured/persisted不表示验证成功；测试仅在当前进程保存，无自动外网健康探针。`finance_test`后台任务使用独立provider、固定官方地址、单次日历业务请求且max_retries=0；不进入采集批次路径。凭据读取顺序为用户文件、进程环境、Windows用户环境；网页更新后旧环境值不覆盖新文件。新Key重置provider、目录缓存、验证状态；保存要求无运行监测或活动任务，演示/竞价保护时段拒绝保存和测试。
+
+默认启动行为仍兼容已有用户自动监测；`run.py --no-auto-start`传递`serve(auto_start=False)`仅启动本机服务。启动器识别旧版本后台并明确要求重启，不终止未知或旧进程。项目路径取自源码位置，用户级凭据在项目外，源码包可部署到任意可写目录。
 
 复盘、补充官方观察、添加自选、个股分析、趋势刷新、AI生成和AI连接测试响应含 `{ok,message,started}`。`started=false` 表示同名任务已在运行，并非又启动一个任务。`jobs` 的键包括 `prepare/review/evidence/llm/llm_test/stock/watchlist/trends`，每个值为 `{status:'running'|'done'|'error',message}`。保护时段个股任务可能已经 `done`，但 `stocks.analysis.status='deferred'`，表示日线在等待09:27，不应当显示计算成功或零分。
 

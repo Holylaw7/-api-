@@ -10,14 +10,27 @@ import webbrowser
 
 ROOT = Path(__file__).resolve().parent
 URL = 'http://127.0.0.1:8765'
+MIN_VERSION = (1, 7, 0)
 
 
 def alive():
     try:
         with urllib.request.urlopen(URL+'/api/health',timeout=1) as res:
-            return json.load(res).get('application') == 'auction-lab'
+            health = json.load(res)
     except Exception:
         return False
+    if not isinstance(health, dict) or health.get('application') != 'auction-lab':
+        return False
+    try:
+        version = tuple(int(part) for part in str(health.get('version', '')).split('.'))
+    except ValueError:
+        version = ()
+    if len(version) != 3 or version < MIN_VERSION:
+        raise RuntimeError('8765 端口上的竞价研究台仍是旧版本。请关闭旧服务或重启电脑，'
+                           '再双击新版启动文件，才能使用「同花顺接入」。'
+                           '\n如需保留旧服务，可运行 python run.py --port 8768 --no-auto-start，'
+                           '并打开 http://127.0.0.1:8768。')
+    return True
 
 
 def main():

@@ -27,6 +27,7 @@
   const dateAtShanghai = () => new Intl.DateTimeFormat('en-CA', {timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit'}).format(new Date());
   const state = {snapshot: null, selected: null, filter: 'all', search: '', page: 'auction', history: [], historyKey: '', historyLastFetch: 0, historyBusy: false, connected: false, configLoaded: false, reportSignature: '', reviewDateTouched: false, watchlistSettingsDirty: false, queryRequested: '', llmProvider: '', llmDirty: false, llmSignature: '', llmSwitching: false, reports: [], reportsBusy: false, reportsMode: '', reportsGeneration: 0, reportSaveBusy: false, reportLoadBusy: false, comparisonBusy: false, comparisonGeneration: 0, diagnosticsBusy: false, diagnosticsLoaded: false};
   Object.assign(state, {sectorSelection: [], sectorMatches: [], sectorSearchBusy: false, sectorFetchBusy: false, sectorCacheBusy: false, sectorEvidence: null, sectorSyncKey: '', sectorPreviewSignature: '', sectorSearchMessage: '', sectorError: ''});
+  Object.assign(state, {finance: null, financeBusy: false, financeLoading: false, financeError: ''});
   let pollTimer = null;
   let polling = false;
   const factors = {
@@ -68,16 +69,17 @@
   }
 
   function showPage(name) {
-    if (!['auction', 'stocks', 'review', 'backtest', 'settings'].includes(name)) return;
+    if (!['auction', 'stocks', 'review', 'backtest', 'finance', 'settings'].includes(name)) return;
     state.page = name;
     document.querySelectorAll('.page').forEach((el) => el.classList.toggle('active', el.id === `page-${name}`));
     document.querySelectorAll('[data-tab]').forEach((el) => el.classList.toggle('active', el.dataset.tab === name));
-    text('page-name', {auction: '实时竞价', stocks: '个股查询', review: '收盘复盘', backtest: '策略回测', settings: '策略与接入'}[name]);
+    text('page-name', {auction: '实时竞价', stocks: '个股查询', review: '收盘复盘', backtest: '策略回测', finance: '同花顺接入', settings: '策略与接入'}[name]);
     history.replaceState(null, '', `#${name}`);
     if (name === 'auction') loadHistory();
     if (name === 'review' && state.snapshot && !state.reportsBusy) loadReports();
     if (name === 'backtest' && state.snapshot && !state.backtestBusy) loadBacktest();
     if (name === 'backtest' && state.snapshot && !state.dailyAuditListBusy) loadDailyAudits();
+    if (name === 'finance') loadFinanceStatus();
   }
 
   async function api(path, body) {
@@ -141,6 +143,124 @@
     $('daily-audit-automation').classList.toggle('warn', !enabled || !snapshot.running);
   }
 
+  function financeConfigured() {
+    return state.finance ? state.finance.configured === true : state.snapshot?.configured === true;
+  }
+
+  function renderFinance() {
+    const finance = state.finance;
+    const supported = Boolean(finance && finance.provider === 'hithink');
+    const demo = state.snapshot?.mode === 'demo';
+    $('finance-demo-notice').classList.toggle('hidden', !demo);
+    $('finance-exit-demo').disabled = Boolean(state.financeBusy || !supported);
+    const configured = financeConfigured();
+    const test = supported ? finance.test || {} : {};
+    const running = test.status === 'running' || state.snapshot?.jobs?.finance_test?.status === 'running';
+    const success = configured && test.status === 'success' && test.ok === true;
+    const failed = configured && test.status === 'error';
+    const persisted = supported ? finance.persisted === true : state.snapshot?.credential_persisted === true;
+    const inputChanged = Boolean($('api-key').value.trim());
+    const pending = !state.snapshot && !finance;
+    const status = pending ? '读取中' : !supported ? '需重启新版' : !configured ? '待配置' : running ? '验证中' : success ? '验证成功' : failed ? '验证失败' : persisted ? '已保存未验证' : '已配置未验证';
+    const shortStatus = pending ? '读取中' : !supported ? '待升级' : !configured ? '待配置' : running ? '验证中' : success ? '已验证' : failed ? '验证失败' : '未验证';
+    const statusClass = success ? 'green' : 'amber';
+    text('credential-status', status);
+    $('credential-status').className = `pill ${statusClass}`;
+    text('finance-settings-status', status);
+    $('finance-settings-status').className = `pill ${statusClass}`;
+    text('finance-nav-status', shortStatus);
+    $('finance-nav-status').className = `finance-nav-status ${success ? 'verified' : failed ? 'failed' : ''}`;
+    $('setup-banner').classList.toggle('hidden', configured && persisted && supported);
+    text('setup-title', !supported && !pending ? '重启新版服务，启用同花顺接入页' : configured ? '同花顺 Key 仅在当前进程中配置' : '接入你自己的同花顺金融 API');
+    text('setup-description', !supported && !pending ? '当前后台尚未提供新版接入接口。请用最新代码重启本机服务；已有行情页面仍可使用。' : configured ? '当前进程可读取密钥，但本页尚未确认连接。打开接入页查看来源、保存至本机或手动测试。' : '申请并保存自己的金融 API Key，测试连接后即可读取行情。无需配置 AI 也能计算竞价与复盘。');
+    text('setup-action', configured ? '查看同花顺接入 ↗' : '配置同花顺 API ↗');
+    text('sidebar-credential', success ? '本机运行 · 同花顺验证成功' : configured ? '本机运行 · 同花顺 Key 已配置' : '本机运行 · 待接入同花顺');
+    const sourceLabels = {none: '未配置', missing: '未配置', process: '当前服务进程环境', process_env: '当前服务进程环境', user_environment: 'Windows 用户环境变量', windows_user_environment: 'Windows 用户环境变量', windows_user_env: 'Windows 用户环境变量', user_file: '本机用户凭据文件', session_saved: '本次会话保存'};
+    text('finance-source', supported ? sourceLabels[finance.credential_source] || '本机凭据来源' : '等待新版服务状态');
+    text('finance-checked-at', test.checked_at ? time(test.checked_at, true) : '尚未验证');
+    text('finance-latency', numeric(test.latency_ms) ? `${num(test.latency_ms, 0)} 毫秒` : '—');
+    text('finance-calendar', numeric(test.calendar_count) ? `${num(test.calendar_count, 0)} 个交易日 / ${test.latest_trade_date || '—'}` : '尚无验证数据');
+    const title = pending ? '等待接入状态' : !supported ? '请重启至 1.7 或更新版本' : !configured ? '尚未配置同花顺 Key' : running ? '正在验证同花顺连接' : success ? '本次连接验证成功' : failed ? '本次连接验证失败' : 'Key 已配置，尚未验证连接';
+    text('finance-test-title', title);
+    const message = pending ? '正在读取本机配置，不会自动请求金融接口。' : !supported ? '当前后台缺少专用接入接口，不能在本页保存或验证。请使用最新代码重启服务。' : !configured ? '先申请并保存你自己的金融 API Key，再点击测试连接。' : running ? test.message || '正在请求官方交易日历，完成后自动显示结果。' : test.message || (success ? '官方认证与交易日历读取成功。' : failed ? '请检查密钥、网络或接口权限，再手动重试。' : '保存配置与连接测试是独立步骤。点击「测试同花顺连接」验证已配置的 Key。');
+    text('finance-test-message', state.financeError || message);
+    $('finance-test-state').className = `finance-test-state ${success ? 'success' : failed || state.financeError ? 'error' : running ? 'running' : ''}`;
+    text('credential-help', '密钥保存在本机用户凭据目录，不写入项目或浏览器存储，也不回显。保存成功后清空输入框；保存不会自动启动监测。');
+    $('api-key').placeholder = configured ? '已配置；如需更换，在此输入新的同花顺 Key' : '粘贴你申请的同花顺金融 API Key';
+    $('api-key').disabled = state.financeBusy || running;
+    const saveReason = !supported ? '请先重启新版服务。' : demo ? '请先点击「退出演示，配置同花顺」，再保存自己的 Key。' : !finance.can_save ? finance.save_block_reason || '当前不能修改密钥，请停止监测并等待任务结束。' : '';
+    const testReason = !supported ? '请先重启新版服务。' : demo ? '请先退出演示，再测试同花顺连接。' : inputChanged ? '输入框已有修改，请先点击「保存同花顺 Key」，再测试已保存的密钥。' : !finance.can_test ? finance.test_block_reason || '当前无法测试，请先配置密钥并等待任务结束。' : '';
+    $('finance-save').disabled = Boolean(state.financeBusy || running || saveReason || !inputChanged);
+    $('finance-save').title = saveReason || '只保存到本机，不启动行情采集。';
+    $('finance-test').disabled = Boolean(state.financeBusy || running || testReason);
+    $('finance-test').title = testReason || '使用当前已配置的 Key，只读取一次官方交易日历。';
+    text('finance-test', running ? '正在验证连接…' : '测试同花顺连接');
+    $('finance-refresh').disabled = state.financeLoading;
+    text('finance-input-status', state.financeError || (state.financeBusy ? '正在提交，请稍候…' : pending ? '正在读取本机接入状态…' : inputChanged ? `${saveReason ? `${saveReason} ` : ''}输入已修改，先保存后测试。` : saveReason || testReason || (configured ? '测试使用已配置的 Key；不会提交空输入或调用 AI。' : '先保存你自己的同花顺 Key，再进行连接测试。')));
+    $('finance-input-status').classList.toggle('warn', Boolean(state.financeError || saveReason || inputChanged));
+    $('sector-finance-setup').classList.toggle('hidden', configured);
+  }
+
+  async function loadFinanceStatus(manual = false) {
+    if (state.financeLoading) return;
+    state.financeLoading = true;
+    renderFinance();
+    try {
+      const finance = await api('/api/finance/status');
+      if (finance.provider !== 'hithink') throw new Error('当前后台未提供新版同花顺接入状态，请重启最新版本服务。');
+      state.finance = finance;
+      if (state.snapshot) state.snapshot.finance = finance;
+      state.financeError = '';
+    } catch (error) {
+      state.financeError = error.message;
+      if (manual) toast(error.message, true);
+    } finally { state.financeLoading = false; renderFinance(); renderSectorControls(); }
+  }
+
+  async function saveFinance(event) {
+    event.preventDefault();
+    if ($('finance-save').disabled) return;
+    const apiKey = $('api-key').value.trim();
+    if (!apiKey) return;
+    state.financeBusy = true; state.financeError = ''; renderFinance();
+    try {
+      const result = await api('/api/finance/config', {api_key: apiKey});
+      $('api-key').value = '';
+      state.finance = result.finance;
+      if (state.snapshot) state.snapshot.finance = result.finance;
+      toast(result.message || '同花顺 Key 已保存。可继续测试连接。');
+      await fetchState();
+    } catch (error) { state.financeError = error.message; toast(error.message, true); }
+    finally { state.financeBusy = false; renderFinance(); }
+  }
+
+  async function testFinance() {
+    if ($('api-key').value.trim()) { toast('输入已修改，请先保存同花顺 Key，再测试连接。', true); return; }
+    if ($('finance-test').disabled) return;
+    state.financeBusy = true; state.financeError = ''; renderFinance();
+    try {
+      const result = await api('/api/finance/test', {});
+      if (result.finance) {
+        state.finance = result.finance;
+        if (state.snapshot) state.snapshot.finance = result.finance;
+      }
+      toast(result.message || '已提交同花顺连接测试。');
+      await fetchState();
+    } catch (error) { state.financeError = error.message; toast(error.message, true); }
+    finally { state.financeBusy = false; renderFinance(); }
+  }
+
+  async function exitFinanceDemo() {
+    if ($('finance-exit-demo').disabled) return;
+    state.financeBusy = true; state.financeError = ''; renderFinance();
+    try {
+      const result = await api('/api/demo/exit', {});
+      toast(result.message || '已退出演示。现在可以配置同花顺 Key，监测尚未启动。');
+      await fetchState();
+    } catch (error) { state.financeError = error.message; toast(error.message, true); }
+    finally { state.financeBusy = false; renderFinance(); }
+  }
+
   function hydrateConfig(snapshot) {
     renderReviewSchedule(snapshot);
     if (state.configLoaded) return;
@@ -160,23 +280,13 @@
     hydrateConfig(snapshot);
     if (!state.watchlistSettingsDirty && document.activeElement !== $('watchlist')) $('watchlist').value = (snapshot.config?.watchlist || []).join(', ');
     const demo = snapshot.mode === 'demo';
-    const credentialPersisted = snapshot.credential_persisted === true;
-    const credentialSource = snapshot.credential_source || snapshot.source;
-    const sessionCredential = Boolean(snapshot.configured) && (snapshot.credential_persisted === false || credentialSource === 'process');
     document.body.dataset.mode = demo ? 'demo' : 'live';
     $('demo-banner').classList.toggle('hidden', !demo);
-    $('setup-banner').classList.toggle('hidden', Boolean(snapshot.configured) && !sessionCredential);
-    text('setup-title', sessionCredential ? '本次会话已连接，尚未保存' : '连接数据源，开始你的竞价研究');
-    text('setup-description', sessionCredential ? '当前服务可继续读取行情。关闭服务后此连接不会保留；自行启动应用后，可在「策略与接入」保存密钥供下次使用。' : '先在「策略与接入」保存 HiThink API Key，再准备关注池并启动监测。');
-    text('setup-action', sessionCredential ? '查看接入设置 ↗' : '配置 API Key ↗');
+    state.finance = snapshot.finance || null;
+    renderFinance();
     text('mode-badge', demo ? 'DEMO' : 'LIVE');
     document.querySelector('.nav-tag').textContent = demo ? 'DEMO' : 'LIVE';
     $('mode-badge').classList.toggle('demo', demo);
-    text('credential-status', sessionCredential ? '会话已连接 · 未保存' : credentialPersisted ? '已本地保存' : snapshot.configured ? '已连接' : '待配置');
-    $('credential-status').className = `pill ${snapshot.configured && !sessionCredential ? 'green' : 'amber'}`;
-    text('sidebar-credential', sessionCredential ? '本机运行 · 仅本次会话连接' : credentialPersisted ? '本机运行 · 密钥本地保存' : '本机运行 · 密钥不回显');
-    text('credential-help', sessionCredential ? '当前密钥仅在服务进程中可用，尚未写入本机凭据文件。自行启动应用后，可保存至 %APPDATA%/hithink-finance/credentials.env 供下次使用；保存前请停止采集并等待任务结束。' : `${credentialPersisted ? '密钥已保存至' : '保存后写入'}本机用户目录 %APPDATA%/hithink-finance/credentials.env，页面不会回显。更新密钥前请先停止采集并等待任务结束。`);
-    $('api-key').placeholder = sessionCredential ? '当前密钥不回显；下次保存时输入' : credentialPersisted ? '已保存；输入新密钥以替换' : snapshot.configured ? '已连接；密钥不回显' : '输入 HiThink API Key';
     renderLLMConfig(snapshot.llm || {}, snapshot.jobs || {});
     text('monitor-status', demo ? '模拟演示' : statuses[snapshot.status] || snapshot.status || '等待启动');
     text('monitor-message', snapshot.message || '等待开始采集');
@@ -1145,8 +1255,8 @@
 
   function sectorBlockedReason(requireReport = true) {
     const snapshot = state.snapshot || {};
+    if (!financeConfigured()) return '请先在「同花顺接入」保存你自己的金融 API Key。';
     if (snapshot.mode !== 'live' || snapshot.review?.mode === 'demo') return '请切换到实盘模式后查询同花顺板块。';
-    if (!snapshot.configured) return '请先在「策略与接入」配置行情 API Key。';
     if (requireReport && (!snapshot.review?.date || !snapshot.review_id)) return '请先生成或读取一份已收盘的真实报告。';
     const stamp = new Date(snapshot.now || Date.now()).getTime() + Math.max(0, Date.now() - (state.snapshotReceivedAt || Date.now()));
     const hhmm = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false}).format(new Date(stamp));
@@ -1171,6 +1281,7 @@
     const searchReason = sectorBlockedReason(false);
     const job = snapshot.jobs?.sectors || {};
     const llmBusy = snapshot.jobs?.llm?.status === 'running';
+    $('sector-finance-setup').classList.toggle('hidden', financeConfigured());
     text('sector-research-date', snapshot.review?.date ? `数据目标日 ${snapshot.review.date}` : '等待收盘报告');
     $('sector-search-button').disabled = Boolean(state.sectorSearchBusy || searchReason);
     $('sector-search-button').title = searchReason || '查询同花顺官方目录，不调用模型。';
@@ -1499,6 +1610,7 @@
     if (!action) return;
     const name = action.dataset.action;
     if (name === 'llm') { await submitLLM(); return; }
+    if (['start', 'prepare', 'review'].includes(name) && !financeConfigured()) { showPage('finance'); toast('请先保存你自己的同花顺金融 API Key，再读取行情。'); return; }
     const body = name === 'review' ? {date: $('review-date').value || undefined} : {};
     await mutate(`/api/${name}`, body, {prepare: '已开始准备关注池', start: '已启动监测', stop: '已停止监测', review: '已开始生成复盘', demo: '已切换到明确标记的模拟演示', llm: '已提交 AI 分析'}[name], action);
     if (name === 'demo') showPage('auction');
@@ -1548,13 +1660,11 @@
     updateWeightTotal();
   });
 
-  $('credentials-form').addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const key = $('api-key').value.trim();
-    if (!key) return;
-    const ok = await mutate('/api/credentials', {api_key: key}, '数据源密钥已保存', event.submitter);
-    if (ok) $('api-key').value = '';
-  });
+  $('finance-form').addEventListener('submit', saveFinance);
+  $('finance-test').addEventListener('click', testFinance);
+  $('finance-exit-demo').addEventListener('click', exitFinanceDemo);
+  $('finance-refresh').addEventListener('click', () => loadFinanceStatus(true));
+  $('api-key').addEventListener('input', () => { state.financeError = ''; renderFinance(); });
   $('stock-query-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     await queryStock($('stock-code').value, event.submitter);

@@ -1,6 +1,8 @@
 # 数据来源、统计口径与扩展契约
 
-适用版本：1.6。新增指定官方板块与成员的有界取数和可追溯AI证据；原有采集与评分口径保持兼容。1.5历史回放、每日核验与外部导入，以及1.4情绪结构、风向标、龙虎榜、分页和限流处理继续使用。
+适用版本：1.7。新增独立同花顺接入页与一次交易日历认证验证；不改变原有采集与评分口径。1.6指定官方板块与成员的有界取数、1.5历史回放/每日核验/外部导入，以及1.4情绪结构/风向标/龙虎榜/分页/限流处理继续使用。
+
+1.7接入说明见 [FINANCE_CONNECTION.md](FINANCE_CONNECTION.md)。新用户从[官方管理页](https://fuyao.aicubes.cn/admin)取得自己的Key；程序以`X-api-key`头调用固定官方地址。网页状态检查不联网，用户点击测试才读取一次`/api/a-share/calendar/trading-days`，不重试；仅HTTP200、code0和非空有效日历才通过。此验证不证明其他行情接口权限或实时性，也不开放尚未发布的资金流接口。官方依据为[完整指南](https://fuyao.aicubes.cn/llms-full.txt)和[快速开始](https://fuyao.aicubes.cn/docs/quickstart/)。
 
 1.4 在2026-09-20重新核对用户指定的[官方完整指南 llms-full.txt](https://fuyao.aicubes.cn/llms-full.txt)、[REST 总览](https://fuyao.aicubes.cn/docs/api-reference/overview/)和[最佳实践](https://fuyao.aicubes.cn/best-practices/)。参数、字段和日期含义以现行REST契约为准；示例中的模拟数值不作为真实数据或时间规则。下方较早的仓库核对记录保留为历史背景。
 

@@ -1,4 +1,4 @@
-# 模块与接口契约 · 1.6
+# 模块与接口契约 · 1.7
 
 Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UTC+08。共享可变状态由service锁保护；密钥不进入状态、文档或测试。字段缺失保留null，调用失败与成功空列表区分。
 
@@ -37,7 +37,25 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 
 ## HTTP
 
-GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: version`、`event: state`加JSON，重连建议为2000毫秒。状态版本变化立即推送完整状态，不等待固定刷新周期；闲时每次最长等待3秒后可发送注释keepalive，完整状态一般15秒刷新一次，09:10–09:26保护时段改为3秒，以更新时钟和陈旧提示。这是页面刷新策略，不改变竞价逐批计算或上游请求频率。GET `/api/history?symbol=完整代码`读取已有本机观察；GET `/api/health`主服务版本为1.6.0。
+主服务版本1.7.0。1.7新增同花顺接入，不改变既有金融数据口径。`GET /api/finance/status`与`state.finance`均返回以下无密钥对象；状态查询不联网：
+
+```text
+finance = {
+  provider: 'hithink', label, base_url: 'https://fuyao.aicubes.cn', configured,
+  credential_source: 'user_file'|'process'|'user_environment'|'missing', persisted,
+  test: {status:'not_tested'|'running'|'success'|'error', ok:null|boolean,
+         checked_at, message, latency_ms, calendar_count, latest_trade_date},
+  can_save, save_block_reason, can_test, test_block_reason
+}
+```
+
+`POST /api/finance/config {api_key}`只保存，返回`{ok,message,finance}`；非空ASCII字符串、最多512字符、禁止空白/控制字符。用户文件优先于进程与Windows用户环境，不改变全局环境。保存须停止监测、无活动任务、实盘模式且保护时段之外；清除旧验证和接入缓存，不采集。
+
+`POST /api/finance/test {}`使用当前配置，返回`{ok,message,started,finance}`，结果在`finance.test`与`jobs.finance_test`推送。同名任务重复不重开，后台一次官方日历请求，max_retries=0；成功需HTTP200、code0与非空有效日期。测试不启动采集，不读取全市场，不调用模型；其他数据权限未由此证明。换Key或模式、保护时段变化使旧结果作废或取消，安全消息不含上游原始正文。验证状态仅在当前进程保留。
+
+`POST /api/demo/exit {}`取消演示、清除合成内存并返回停止的live视图，只读已有本机实盘报告，不联网、不启动。已处于live时不改变运行状态。首次用户可先退出演示再配置Key。所有新POST沿用下述本机同源检查；接入操作详见`docs/FINANCE_CONNECTION.md`。
+
+GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: version`、`event: state`加JSON，重连建议为2000毫秒。状态版本变化立即推送完整状态，不等待固定刷新周期；闲时每次最长等待3秒后可发送注释keepalive，完整状态一般15秒刷新一次，09:10–09:26保护时段改为3秒，以更新时钟和陈旧提示。这是页面刷新策略，不改变竞价逐批计算或上游请求频率。GET `/api/history?symbol=完整代码`读取已有本机观察；GET `/api/health`主服务版本为1.7.0。
 
 | POST路径 | JSON请求体及作用 |
 | --- | --- |

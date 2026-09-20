@@ -6,7 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit, urlencode
 
-from .config import ROOT, finance_key, save_finance_key
+from .config import ROOT, finance_key
 from .ai_gateway import save_profile, select_provider
 from .service import Service, now_sh
 from .research_data import MAX_IMPORT_BYTES, import_template
@@ -73,9 +73,11 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         try:
             if path == '/api/health':
-                self._json({'ok':True,'application':'auction-lab','version':'1.6.0'})
+                self._json({'ok':True,'application':'auction-lab','version':'1.7.0'})
             elif path == '/api/state':
                 self._json(service.snapshot())
+            elif path == '/api/finance/status':
+                self._json(service.finance_status())
             elif path == '/api/events':
                 self.send_response(200)
                 self.send_header('Content-Type','text/event-stream; charset=utf-8')
@@ -230,6 +232,11 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/demo':
                 service.demo()
                 message = '正在加速演示，所有数据均为合成示例'
+            elif path == '/api/demo/exit':
+                if body:
+                    raise ValueError('退出演示请发送空对象')
+                service.exit_demo()
+                message = '已返回实盘页面；未启动监测或联网取数'
             elif path == '/api/review':
                 started = service.run_review(body.get('date') or None)
                 message = '复盘任务已开始' if started else '已有复盘任务正在运行'
@@ -280,12 +287,22 @@ class Handler(BaseHTTPRequestHandler):
                 started = service.refresh_trends()
                 message = '走势筛选已开始' if started else '已有走势筛选任务，请等待完成'
             elif path == '/api/credentials':
-                if service.running or any(j.get('status') == 'running' for j in service.jobs.values()):
-                    raise ValueError('请先停止采集并等待任务结束后更新凭据')
-                save_finance_key(body.get('api_key',''))
-                service.provider = None
+                service.save_finance_config(body.get('api_key'))
                 service.start()
                 message = 'Key 已保存在本机用户凭据文件，自动服务已启动'
+            elif path == '/api/finance/config':
+                if set(body) != {'api_key'}:
+                    raise ValueError('数据接入仅接受 api_key，官方服务地址固定')
+                finance = service.save_finance_config(body.get('api_key'))
+                self._json({'ok':True, 'message':'同花顺 Key 已保存，尚未启动监测；可先测试连接', 'finance':finance})
+                return
+            elif path == '/api/finance/test':
+                if body:
+                    raise ValueError('连接测试使用已保存的同花顺 Key，请发送空对象')
+                started = service.run_finance_test()
+                self._json({'ok':True, 'message':'正在验证官方交易日历，不启动监测' if started else '连接测试正在进行',
+                            'started':started, 'finance':service.finance_status()})
+                return
             elif path == '/api/llm-config':
                 save_profile(dict(body, provider=body.get('provider', 'custom')))
                 if 'provider' not in body:
@@ -317,10 +334,10 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok':False,'message':'操作未完成，请检查服务状态'},500)
 
 
-def serve(port=8765):
+def serve(port=8765, *, auto_start=True):
     service = Service()
     server = LocalServer(('127.0.0.1',port),service)
-    if finance_key():
+    if auto_start and finance_key():
         service.start()
     try:
         server.serve_forever(poll_interval=.5)

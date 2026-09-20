@@ -8,10 +8,11 @@ import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .config import DATA, atomic_json, finance_key, credential_status, load_config, validate_config
+from .config import (DATA, atomic_json, finance_key, credential_status, load_config,
+                     validate_config, save_finance_key, validate_finance_key)
 from .ai_gateway import active_config as load_llm, profiles_state, test_connection, AIGatewayError
 from .engine import AuctionEngine, strict_continuity
-from .provider import HiThinkProvider
+from .provider import HiThinkProvider, APIError, BASE_URL
 from .review import build_review
 from .storage import Store
 from .stocks import analyze_stock, validate_code
@@ -113,6 +114,9 @@ class Service:
         self.llm_result = None
         self.llm_results = self.report_library.load_ai(self.review) if self.review else {}
         self.llm_connection_test = None
+        self.finance_connection_test = self._empty_finance_test()
+        self._finance_test_key = None
+        self._finance_revision = 0
         self.last_review_attempt = None
         self.retry_prepare_at = 0
         self.api_backoff_until = 0
@@ -167,6 +171,7 @@ class Service:
             # An optional AI configuration problem cannot interrupt market SSE.
             ai_state = {'active_provider':None, 'profiles':[], 'error':str(exc)}
             active = {'id':None, 'configured':False, 'base_url':'', 'model':'', 'label':'AI 配置需检查'}
+        finance = self.finance_status()
         with self.lock:
             current = now_sh()
             rows = self.engine.rankings(current) if self.mode == 'live' else self.engine.rankings()
@@ -213,7 +218,7 @@ class Service:
             summary['provisional_count'] = sum(bool(r.get('is_provisional')) for r in rows)
             phase = phase_at(current, current.date().isoformat() in self.days) if self.mode == 'live' else 'demo'
             state = dict(mode=self.mode, status=self.status, message=self.message,
-                         now=current.isoformat(), configured=bool(finance_key()), running=self.running,
+                         now=current.isoformat(), configured=finance['configured'], running=self.running,
                          calendar={'dates': self.days[-15:], 'today_is_trading': current.date().isoformat() in self.days,
                                    'checked_on': self.calendar_loaded_date},
                          auction=dict(phase=phase, date=self.session_date, rows=public_rows,
@@ -229,7 +234,7 @@ class Service:
                                                 for c in self.config['watchlist']],
                                      trend_pool=self._public_report(self.trend_pool) if self.mode == 'live' else {}),
                          review=self._public_report(self.review), review_id=self._review_identity(),
-                         review_sentiment=self._review_sentiment(), api=self._api_status(), jobs=self.jobs, config=self.config,
+                         review_sentiment=self._review_sentiment(), api=self._api_status(), finance=finance, jobs=self.jobs, config=self.config,
                          research=self.research_summary,
                          sector_research=(self.sector_summary if self.mode == 'live' and
                              self.sector_summary.get('review_id') == self._review_identity() else {}),
@@ -237,8 +242,137 @@ class Service:
                                   model=active['model'], label=active['label'],
                                   result=self.llm_results.get(active['id']),
                                   connection_test=self.llm_connection_test), errors=self.errors)
-            state.update(credential_status())
+            state.update(credential_persisted=finance['persisted'], credential_source=finance['credential_source'])
             return copy.deepcopy(state)
+
+    @staticmethod
+    def _empty_finance_test():
+        return dict(status='not_tested', ok=None, checked_at=None, message='尚未测试官方接口连接',
+                    latency_ms=None, calendar_count=None, latest_trade_date=None)
+
+    def _finance_save_block(self):
+        if self.mode != 'live':
+            return '演示模式不能更改真实数据接入，请先返回实盘模式'
+        if self._auction_priority():
+            return '09:10–09:26 优先竞价，请在09:27后更改数据接入'
+        if self.running:
+            return '请先停止监测，再保存数据 Key'
+        if any(job.get('status') == 'running' for job in self.jobs.values()) or self.sector_catalog_lock.locked():
+            return '请等待当前任务完成，再保存数据 Key'
+        return ''
+
+    def _finance_test_block(self, configured):
+        if self.mode != 'live':
+            return '演示模式不调用真实接口，请先返回实盘模式'
+        if self._auction_priority():
+            return '09:10–09:26 优先竞价，请在09:27后测试连接'
+        if not configured:
+            return '请先保存同花顺金融数据 API Key'
+        if self.jobs.get('finance_test', {}).get('status') == 'running':
+            return '同花顺连接测试正在进行，请等待完成'
+        return ''
+
+    def finance_status(self):
+        """Local diagnostics only: no upstream request and no secret fragments."""
+        key = finance_key()
+        credential = credential_status()
+        with self.lock:
+            if self._finance_test_key is not None and self._finance_test_key != key:
+                self.finance_connection_test = self._empty_finance_test()
+                self._finance_test_key = None
+            save_block = self._finance_save_block()
+            test_block = self._finance_test_block(bool(key))
+            return dict(provider='hithink', label='同花顺金融数据 API', base_url=BASE_URL,
+                        configured=bool(key), credential_source=credential.get('credential_source', 'missing'),
+                        persisted=bool(credential.get('credential_persisted', False)),
+                        test=copy.deepcopy(self.finance_connection_test),
+                        can_save=not bool(save_block), save_block_reason=save_block,
+                        can_test=not bool(test_block), test_block_reason=test_block)
+
+    def save_finance_config(self, key):
+        """Save explicitly supplied credentials without starting collection."""
+        validate_finance_key(key)
+        with self.lock:
+            reason = self._finance_save_block()
+            if reason:
+                raise ValueError(reason)
+            save_finance_key(key)
+            self._finance_revision += 1
+            self.demo_generation += 1
+            self.provider = None
+            self.finance_connection_test = self._empty_finance_test()
+            self._finance_test_key = None
+            self.sector_catalog = []
+            self.sector_catalog_at = 0
+            self.api_backoff_until = 0
+            self.api_backoff_seconds = 0
+            self.message = '同花顺数据 Key 已保存，可先测试连接，再启动监测'
+        self.touch()
+        return self.finance_status()
+
+    def run_finance_test(self):
+        """One bounded official calendar request; never prepare or start jobs."""
+        key = finance_key()
+        with self.lock:
+            if self.jobs.get('finance_test', {}).get('status') == 'running':
+                return False
+            reason = self._finance_test_block(bool(key))
+            if reason:
+                raise ValueError(reason)
+            revision, generation = self._finance_revision, self.demo_generation
+            interval = self.config['request_interval']
+            timeout = min(8, self.config['request_timeout'])
+            self._finance_test_key = key
+            self.finance_connection_test = dict(self._empty_finance_test(), status='running', message='正在读取官方交易日历验证连接')
+
+            def still_current():
+                return revision == self._finance_revision and key == finance_key()
+
+            def cancelled():
+                return (self.shutdown.is_set() or self.mode != 'live' or generation != self.demo_generation
+                        or self._auction_priority() or not still_current())
+
+            def work():
+                began = time.monotonic()
+                result = dict(self._empty_finance_test(), status='error', ok=False)
+                try:
+                    if cancelled():
+                        raise ValueError('连接测试已取消，请在实盘模式和竞价保护时段外重试')
+                    client = HiThinkProvider(key, min_interval=interval, timeout=timeout, max_retries=0)
+                    days = client.calendar()
+                    if (not isinstance(days, list) or not days or len(days) > 10000
+                            or any(not isinstance(day, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', day) for day in days)):
+                        raise ValueError('官方接口未返回有效的非空交易日历，连接尚未通过验证')
+                    for day in days:
+                        datetime.strptime(day, '%Y-%m-%d')
+                    if cancelled():
+                        raise ValueError('模式、凭据或采集时段已改变，本次连接测试已取消')
+                    result.update(status='success', ok=True, message='官方交易日历连接成功；尚未开始监测或验证其他接口权限',
+                                  calendar_count=len(set(days)), latest_trade_date=max(days))
+                except APIError as exc:
+                    messages = {2001:'同花顺 Key 认证失败', 2003:'同花顺 Key 无效或无接口权限',
+                                401:'同花顺 Key 认证失败', 403:'同花顺接口拒绝访问',
+                                429:'同花顺接口限流，请稍后重试', 4001:'同花顺接口限流，请稍后重试'}
+                    result['message'] = messages.get(exc.code, '官方连接验证失败，请检查网络、Key 权限或接口返回格式')
+                    if isinstance(exc.code, int) and not isinstance(exc.code, bool):
+                        result['message'] += f'（code={exc.code}）'
+                except ValueError:
+                    result['message'] = ('模式、凭据或采集时段已改变，本次连接测试已取消' if cancelled()
+                                         else '官方接口未返回有效的非空交易日历，连接尚未通过验证')
+                except Exception:
+                    result['message'] = '连接测试未完成，请检查本机网络与数据接入配置'
+                result.update(checked_at=now_sh().isoformat(), latency_ms=round((time.monotonic()-began)*1000))
+                with self.lock:
+                    if still_current():
+                        self.finance_connection_test = result
+                    else:
+                        self.finance_connection_test = self._empty_finance_test()
+                        self._finance_test_key = None
+                self.touch()
+                if not result['ok']:
+                    raise ValueError(result['message'])
+
+            return self._job('finance_test', work)
 
     @staticmethod
     def _public_report(value):
@@ -1087,6 +1221,43 @@ class Service:
                     if row.get('thscode') == symbol:
                         result.append(dict(row, received_at=received, stage=stage))
         return dict(symbol=symbol,date=self.session_date,mode=self.mode,items=result[-1000:])
+
+    def exit_demo(self):
+        """Return to a stopped real-data view without credentials or network."""
+        with self.lock:
+            if self.mode != 'demo':
+                return
+            self.demo_generation += 1
+            self.running = False
+            self.mode = 'live'
+            self.status = 'stopped'
+            self.message = '已退出演示；可配置同花顺数据接入，尚未启动监测'
+            self.engine.reset()
+            self.provisional_rows.clear()
+            self.codes = []
+            self.all_codes = []
+            self.sources = {}
+            self.context = {}
+            self.days = []
+            self.session_date = None
+            self.prepared_date = None
+            self.calendar_loaded_date = None
+            self.session_trends = {}
+            self.processed.clear()
+            self.final_codes.clear()
+            self.finalized = False
+            self.cycle_seconds = 0
+            self.last_batch_ms = None
+            self.stock_analysis = None
+            self.pending_stock = None
+            self.query_code = None
+            self.sector_summary = {}
+            self.review = self.store.latest_report('live')
+            self.latest_review = self.review
+            self.viewing_archive = False
+            self.llm_result = None
+            self.llm_results = self.report_library.load_ai(self.review) if self.review else {}
+        self.touch()
 
     def demo(self):
         with self.lock:

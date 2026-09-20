@@ -69,31 +69,55 @@ def credential_dir():
     return Path(os.environ.get('XDG_CONFIG_HOME', str(Path.home() / '.config'))) / 'hithink-finance'
 
 
-def finance_key():
-    key = os.environ.get('HITHINK_FINANCE_API_KEY', '').strip()
-    if key:
-        return key
+def _windows_finance_key():
     if os.name == 'nt':
         try:
             import winreg
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, 'Environment') as reg:
-                key = winreg.QueryValueEx(reg, 'HITHINK_FINANCE_API_KEY')[0].strip()
-                if key:
-                    return key
+                value = winreg.QueryValueEx(reg, 'HITHINK_FINANCE_API_KEY')[0]
+                return value.strip() if isinstance(value, str) else ''
         except OSError:
             pass
+    return ''
+
+
+def _file_finance_key():
     path = credential_dir() / 'credentials.env'
     if path.exists():
+        if path.stat().st_size > 1_048_576:
+            raise ValueError('用户凭据文件过大，请检查本机配置')
         for line in path.read_text(encoding='utf-8-sig').splitlines():
             if line.startswith('HITHINK_FINANCE_API_KEY='):
                 return line.partition('=')[2].strip().strip('\"').strip("'")
     return ''
 
 
+def _finance_credential():
+    # A key explicitly saved in the webpage survives restarts even when the
+    # launcher inherited an older environment value. Never mutate user env.
+    key = _file_finance_key()
+    if key:
+        return key, 'user_file', True
+    key = os.environ.get('HITHINK_FINANCE_API_KEY', '').strip()
+    if key:
+        return key, 'process', False
+    key = _windows_finance_key()
+    return (key, 'user_environment', True) if key else ('', 'missing', False)
+
+
+def finance_key():
+    return _finance_credential()[0]
+
+
+def validate_finance_key(key):
+    if (not isinstance(key, str) or not key or len(key) > 512
+            or any(ord(c) < 33 or ord(c) > 126 or c in '\"\'' for c in key)):
+        raise ValueError('API Key 须为 1–512 位文本，不能包含空格、换行、控制字符或引号')
+    return key
+
+
 def save_finance_key(key):
-    key = str(key).strip()
-    if not key or len(key) > 512 or any(c.isspace() for c in key):
-        raise ValueError('API Key 为空或格式无效')
+    key = validate_finance_key(key)
     folder = credential_dir()
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / 'credentials.env'
@@ -106,27 +130,11 @@ def save_finance_key(key):
     if os.name != 'nt':
         temp.chmod(0o600)
     temp.replace(path)
-    os.environ['HITHINK_FINANCE_API_KEY'] = key
 
 
 def credential_status():
-    active = finance_key()
-    if not active:
-        return {'credential_persisted':False,'credential_source':'missing'}
-    path = credential_dir() / 'credentials.env'
-    if path.exists():
-        for line in path.read_text(encoding='utf-8-sig').splitlines():
-            if line.startswith('HITHINK_FINANCE_API_KEY=') and line.partition('=')[2].strip().strip('\"').strip("'") == active:
-                return {'credential_persisted':True,'credential_source':'user_file'}
-    if os.name == 'nt':
-        try:
-            import winreg
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,'Environment') as reg:
-                if winreg.QueryValueEx(reg,'HITHINK_FINANCE_API_KEY')[0].strip() == active:
-                    return {'credential_persisted':True,'credential_source':'user_environment'}
-        except OSError:
-            pass
-    return {'credential_persisted':False,'credential_source':'process'}
+    _, source, persisted = _finance_credential()
+    return {'credential_persisted':persisted,'credential_source':source}
 
 
 def load_llm():
