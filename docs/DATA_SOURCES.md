@@ -1,6 +1,6 @@
 # 数据来源、统计口径与扩展契约
 
-适用版本：1.4。原有采集与评分口径保持兼容；1.4 增加本机情绪结构、按报告日期手动读取风向标与龙虎榜，以及分页和限流处理。
+适用版本：1.5。原有采集与评分口径保持兼容；1.5 增加真实历史竞价回放、每日评分核验与有来源声明的外部历史导入。1.4 的本机情绪结构、显式报告日期的风向标与龙虎榜，以及分页和限流处理继续使用。
 
 1.4 在2026-09-20重新核对用户指定的[官方完整指南 llms-full.txt](https://fuyao.aicubes.cn/llms-full.txt)、[REST 总览](https://fuyao.aicubes.cn/docs/api-reference/overview/)和[最佳实践](https://fuyao.aicubes.cn/best-practices/)。参数、字段和日期含义以现行REST契约为准；示例中的模拟数值不作为真实数据或时间规则。下方较早的仓库核对记录保留为历史背景。
 
@@ -8,12 +8,24 @@
 
 2026-09-20 补充联网核对：[官方 README](https://github.com/HiThink-Tech/Financial-API/blob/main/README.md)已按业务域组织原子接口文档。旧聚合路径 `docs/api/endpoints-auction.md`、`docs/api/endpoints-special-data.md` 在本次访问官方 main 原始文件时返回 404，因此不以旧地址内容作依据；当前采用 [集合竞价快照](https://github.com/HiThink-Tech/Financial-API/blob/main/docs/api/a-share/auction-snapshot.md)和[涨停股票池](https://github.com/HiThink-Tech/Financial-API/blob/main/docs/api/a-share/special-data-limit-up-pool.md)等有效页面。文档变化不代表自动新增了已验证的数据能力。
 
+## 1.5 历史竞价与结果标签
+
+本次核对 [官方竞价 REST](https://fuyao.aicubes.cn/docs/api-reference/auction/) 与 [完整指南](https://fuyao.aicubes.cn/llms-full.txt)：`GET /api/a-share/auction/snapshot` 仅有 `thscodes` 和 `stage=live/final`，**没有历史日期参数**。因此仅凭近几日涨停池无法补算完整历史竞价七因子，当前快照不能贴上过去日期。按日期的短线风向标只提供官方选择样本的竞价涨幅等字段，缺少前段金额、换手、量比与后段轨迹，也不能证明当时全候选样本完整，不作为七因子回测替代品。
+
+研究使用三类留存证据：本机实际逐批接收的真实竞价；当时冻结的前日完整池、日历和候选范围；目标日收盘后取得的完整涨停池。原排名时点快照存在则直接保留；不存在时只可按当时记录权重重放并标来源。`data.timestamp` 仍为响应组装时间，不能证明交易所实时发生时点；回放以真正的本机接收时点截断，不把事后下载时间回填成早盘时间。
+
+外部 JSON 须声明提供者、数据版本、金额元、百分数原值、带时区观察时间与当时可见性，由提供者负责核实；程序验证结构不等于验证来源真实性。每次导入 1—40 日且含外层的提交不超过 5 MiB，总计最多 120 日，每日最多 5,000 批，每批最多 100 股；不能覆盖已有本机实盘或另一个导入版本。详细字段见 [BACKTEST.md](BACKTEST.md)，股票代码必须为字符串及完整交易所后缀，缺值用 `null`。
+
+结果标签定义为“是否属于日期一致、完整、在目标日 15:10 及以后取得的涨停池”。15:10 是本地研究门槛；官网未承诺这就是永不修订的最终池。分页失败、缺池与未知保持缺失，不能记为未涨停。上下文固定昨日涨停候选，自选和趋势股只有当时采集的批次才存在，当前参数研究不声称已验证所有自选或全市场。
+
+截至升级核查，本机只存在演示竞价记录，不能得出真实七因子改善结论；已留存十日完整涨停池只能计算延续基线。原始批次和每日档案不因调参主动清理；实验读取和外部 AI 开发集均为本机操作，不额外拉取历史行情。完整导出可能含保留日期结果，自动调参应使用专用开发集出口，避免用检验标签选参数。
+
 ## 已使用的公开接口
 
 | 功能 | GET 路径 | 完整性及时间限制 |
 | --- | --- | --- |
 | 交易日历 | `/api/a-share/calendar/trading-days` | 无参数，近一年至今日；不能当作未来节假日日历 |
-| 实时/终态竞价 | `/api/a-share/auction/snapshot` | `stage=live/final`；原始入参最多100个代码，再去重；完整交易所后缀 |
+| 实时/终态竞价 | `/api/a-share/auction/snapshot` | `stage=live/final`；原始入参最多100个代码，再去重；完整交易所后缀；无历史日期参数 |
 | 涨停、跌停、炸板池 | `/api/a-share/special-data/{limit-up,limit-down,limit-break}-pool` | `date_ms` 是上海时区零点；逐页读取，每页200，核对总数，失败不伪装成空池 |
 | 连板天梯 | `/api/a-share/special-data/limit-up-ladder` | 近30个交易日、每个板位最多4只；有截断，不能当全市场统计分母 |
 | 全市场行情 | `/api/a-share/prices/snapshot` | 省略代码后每页100；按代码表 `total` 读取所有页，即使中间页有效行情为空也继续 |

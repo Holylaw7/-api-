@@ -67,14 +67,16 @@
   }
 
   function showPage(name) {
-    if (!['auction', 'stocks', 'review', 'settings'].includes(name)) return;
+    if (!['auction', 'stocks', 'review', 'backtest', 'settings'].includes(name)) return;
     state.page = name;
     document.querySelectorAll('.page').forEach((el) => el.classList.toggle('active', el.id === `page-${name}`));
     document.querySelectorAll('[data-tab]').forEach((el) => el.classList.toggle('active', el.dataset.tab === name));
-    text('page-name', {auction: '实时竞价', stocks: '个股查询', review: '收盘复盘', settings: '策略与接入'}[name]);
+    text('page-name', {auction: '实时竞价', stocks: '个股查询', review: '收盘复盘', backtest: '策略回测', settings: '策略与接入'}[name]);
     history.replaceState(null, '', `#${name}`);
     if (name === 'auction') loadHistory();
     if (name === 'review' && state.snapshot && !state.reportsBusy) loadReports();
+    if (name === 'backtest' && state.snapshot && !state.backtestBusy) loadBacktest();
+    if (name === 'backtest' && state.snapshot && !state.dailyAuditListBusy) loadDailyAudits();
   }
 
   async function api(path, body) {
@@ -127,7 +129,19 @@
     text('weight-total', `合计 ${num(total, 1)}%`);
   }
 
+  function renderReviewSchedule(snapshot) {
+    const config = snapshot.config || {};
+    if (!state.runtimeScheduleDirty) {
+      if (document.activeElement !== $('auto-review')) $('auto-review').checked = config.auto_review === true;
+      if (document.activeElement !== $('review-time')) $('review-time').value = config.review_time || '15:10';
+    }
+    const enabled = config.auto_review === true;
+    text('daily-audit-automation', enabled ? `自动收盘复盘与竞价核验：已开启 · 上海时间 ${config.review_time || '15:10'}。${snapshot.running ? '需保持监测运行。' : '当前监测未启动，启动后才会自动执行。'}` : '自动收盘复盘与竞价核验：已关闭。可在「策略与接入 → 采集范围」开启，保存后启动监测。');
+    $('daily-audit-automation').classList.toggle('warn', !enabled || !snapshot.running);
+  }
+
   function hydrateConfig(snapshot) {
+    renderReviewSchedule(snapshot);
     if (state.configLoaded) return;
     const config = snapshot.config || {};
     $('universe').value = config.universe || 'focus';
@@ -196,6 +210,7 @@
     renderStocks(snapshot.stocks || {}, snapshot.jobs || {});
     renderReview(snapshot.review, snapshot.jobs?.review);
     renderResearch(snapshot);
+    syncBacktest(snapshot);
     renderReportControls();
     const reviewJobStatus = snapshot.jobs?.review?.status;
     if (state.reviewJobStatus === 'running' && reviewJobStatus === 'done') {
@@ -661,6 +676,259 @@
     finally { state.diagnosticsBusy = false; $('diagnostics-refresh').disabled = false; }
   }
 
+  function backtestBlockedReason() {
+    if (!state.snapshot) return '正在连接本机服务。';
+    if (state.snapshot.mode !== 'live') return '演示模式不运行或导入真实历史回测。';
+    const stamp = new Date(state.snapshot.now || Date.now()).getTime() + Math.max(0, Date.now() - (state.snapshotReceivedAt || Date.now()));
+    const hhmm = new Intl.DateTimeFormat('en-GB', {timeZone: 'Asia/Shanghai', hour: '2-digit', minute: '2-digit', hour12: false}).format(new Date(stamp));
+    if (hhmm >= '09:10' && hhmm <= '09:26') return '09:10—09:26 优先竞价，09:27 后可运行实验或导入；已有结果仍可浏览。';
+    if (state.backtestRunBusy || state.backtestImportBusy || state.snapshot.jobs?.research?.status === 'running') return '正在处理历史研究资料，请等待当前任务完成。';
+    return '';
+  }
+
+  function renderBacktestControls() {
+    const reason = backtestBlockedReason();
+    const job = state.snapshot?.jobs?.research || {};
+    $('backtest-run').disabled = Boolean(reason);
+    $('backtest-run').title = reason || '按当前权重回放本机真实历史；不会自动替换参数。';
+    $('backtest-run').textContent = state.backtestRunBusy || job.status === 'running' ? '正在运行回测…' : '运行本地回测';
+    $('backtest-import-button').disabled = Boolean(reason);
+    $('backtest-import-button').title = reason;
+    $('backtest-refresh').disabled = Boolean(state.backtestBusy) || state.snapshot?.mode !== 'live';
+    text('backtest-job-status', job.status === 'error' ? `本次实验未完成：${job.message || '请稍后重试。'}${state.backtest?.id ? ' 上一次已保存的结果仍保留。' : ''}` : reason || (state.backtestBusy ? '正在读取本机实验结果…' : '只读取本机历史数据，不调用行情或 AI 接口；参数建议不会自动应用。'));
+    $('backtest-job-status').classList.toggle('warn', job.status === 'error' || Boolean(reason && !state.backtestRunBusy && job.status !== 'running'));
+    for (const [id, format] of [['backtest-markdown', 'markdown'], ['backtest-json', 'json']]) {
+      const link = $(id);
+      const available = state.snapshot?.mode === 'live' && Boolean(state.backtest?.id);
+      link.classList.toggle('disabled-link', !available);
+      link.setAttribute('aria-disabled', String(!available));
+      if (available) link.href = `/api/research/export?${new URLSearchParams({id: state.backtest.id, format})}`;
+      else link.removeAttribute('href');
+    }
+    const aiDatasetLink = $('backtest-ai-dataset');
+    const aiDatasetAvailable = state.snapshot?.mode === 'live' && Boolean(state.backtest?.id);
+    aiDatasetLink.classList.toggle('disabled-link', !aiDatasetAvailable);
+    aiDatasetLink.setAttribute('aria-disabled', String(!aiDatasetAvailable));
+    if (aiDatasetAvailable) aiDatasetLink.href = `/api/research/ai-dataset?${new URLSearchParams({id: state.backtest.id})}`;
+    else aiDatasetLink.removeAttribute('href');
+    $('daily-audit-refresh').disabled = state.snapshot?.mode !== 'live' || Boolean(state.dailyAuditListBusy || state.dailyAuditBusy);
+    for (const [id, format] of [['daily-audit-markdown', 'markdown'], ['daily-audit-json', 'json']]) {
+      const link = $(id);
+      const available = state.snapshot?.mode === 'live' && Boolean(state.dailyAudit?.id || state.dailyAudit?.frozen_id) && !state.dailyAuditBusy;
+      link.classList.toggle('disabled-link', !available);
+      link.setAttribute('aria-disabled', String(!available));
+      if (available) link.href = `/api/research/daily/export?${new URLSearchParams({date: state.dailyAudit.date, format})}`;
+      else link.removeAttribute('href');
+    }
+  }
+
+  function syncBacktest(snapshot) {
+    if (state.backtestMode !== snapshot.mode) {
+      state.backtestMode = snapshot.mode;
+      state.backtest = null;
+      state.backtestRequestedId = undefined;
+      state.dailyAudit = null;
+      state.dailyAuditListLoaded = false;
+      state.dailyAuditGeneration = (state.dailyAuditGeneration || 0) + 1;
+      state.dailyAuditListGeneration = (state.dailyAuditListGeneration || 0) + 1;
+      state.dailyAuditBusy = false;
+      state.dailyAuditListBusy = false;
+      $('daily-audit-date').innerHTML = '<option value="">暂无真实每日存档</option>';
+      renderDailyAudit();
+      renderBacktestReport();
+    }
+    const currentId = snapshot.research?.id || '';
+    if (state.page === 'backtest' && snapshot.mode === 'live' && !state.backtestBusy && state.backtestRequestedId !== currentId) loadBacktest();
+    if (state.page === 'backtest' && snapshot.mode === 'live' && !state.dailyAuditListBusy && !state.dailyAuditListLoaded) loadDailyAudits();
+    renderBacktestControls();
+  }
+
+  async function loadDailyAudits() {
+    if (state.dailyAuditListBusy || state.snapshot?.mode !== 'live') return;
+    state.dailyAuditListBusy = true;
+    state.dailyAuditListLoaded = true;
+    const generation = (state.dailyAuditListGeneration || 0) + 1;
+    state.dailyAuditListGeneration = generation;
+    renderBacktestControls();
+    try {
+      const result = await api('/api/research/daily');
+      if (state.snapshot?.mode !== 'live' || generation !== state.dailyAuditListGeneration) return;
+      const items = list(result.items).filter((item) => /^\d{4}-\d{2}-\d{2}$/.test(item.date || ''));
+      const previousDate = $('daily-audit-date').value;
+      $('daily-audit-date').innerHTML = items.length ? items.map((item) => `<option value="${esc(item.date)}">${esc(item.date)} · ${esc({frozen: '已冻结 · 待收盘核验', ready: '已核验', partial: '部分数据', unavailable: '尚不可用'}[item.status] || '已存档')}</option>`).join('') : '<option value="">暂无真实每日存档</option>';
+      $('daily-audit-date').disabled = !items.length;
+      if (items.some((item) => item.date === previousDate)) $('daily-audit-date').value = previousDate;
+      if (items.length) await loadDailyAudit();
+      else { state.dailyAudit = null; renderDailyAudit(); }
+    } catch (error) { text('daily-audit-status', `每日存档读取失败：${error.message}`); }
+    finally { state.dailyAuditListBusy = false; renderBacktestControls(); }
+  }
+
+  async function loadDailyAudit() {
+    const date = $('daily-audit-date').value;
+    if (!date || state.snapshot?.mode !== 'live') return;
+    const generation = (state.dailyAuditGeneration || 0) + 1;
+    state.dailyAuditGeneration = generation;
+    state.dailyAuditBusy = true;
+    state.dailyAudit = null;
+    renderDailyAudit();
+    text('daily-audit-status', `正在读取 ${date} 的原评分核验…`);
+    renderBacktestControls();
+    try {
+      const result = await api(`/api/research/daily?${new URLSearchParams({date})}`);
+      if (generation !== state.dailyAuditGeneration || state.snapshot?.mode !== 'live') return;
+      state.dailyAudit = result;
+      renderDailyAudit();
+    } catch (error) { if (generation === state.dailyAuditGeneration) text('daily-audit-status', `每日存档读取失败：${error.message}`); }
+    finally { if (generation === state.dailyAuditGeneration) state.dailyAuditBusy = false; renderBacktestControls(); }
+  }
+
+  function renderDailyAudit() {
+    const artifact = state.snapshot?.mode === 'live' ? state.dailyAudit : null;
+    const sessions = list(artifact?.sessions);
+    const checkpoint = $('daily-audit-checkpoint').value;
+    $('daily-audit-checkpoint').innerHTML = sessions.length ? sessions.map((session, index) => `<option value="${index}">${esc(session.checkpoint)}${session.checkpoint === '09:24:50' ? ' · 盘前' : ' · 收尾'}</option>`).join('') : '<option value="">等待存档</option>';
+    $('daily-audit-checkpoint').value = sessions.length ? String(sessions[Number(checkpoint)] ? Number(checkpoint) : 0) : '';
+    $('daily-audit-checkpoint').disabled = !sessions.length;
+    renderDailyAuditRows();
+  }
+
+  function renderDailyAuditRows() {
+    const artifact = state.snapshot?.mode === 'live' ? state.dailyAudit : null;
+    const session = $('daily-audit-checkpoint').value !== '' ? list(artifact?.sessions)[Number($('daily-audit-checkpoint').value)] : null;
+    const rows = list(session?.rows);
+    const quality = session?.quality || {};
+    const provenance = session?.strategy_provenance || {};
+    const scoreMethod = session?.method === 'recorded_ranking' ? '原始评分记录' : session ? '按原权重重放' : '等待评分证据';
+    const status = {frozen: '已冻结竞价评分，等待收盘完整池核验', ready: '已完成收盘核验', partial: '存在缺失或待核验项', unavailable: '尚无可用存档'}[artifact?.status] || '已保存';
+    const provenanceText = provenance.legacy_fallback ? '旧记录缺少当时的权重证据；这是带标记的恢复值，不能视为已证实的当日原评分。' : provenance.weights_at ? `权重记录时间 ${provenance.weights_at}` : '';
+    text('daily-audit-status', artifact?.date ? `${artifact.date} · ${status} · ${scoreMethod}${artifact.frozen_at || artifact.auction_frozen_at ? ` · 竞价冻结于 ${time(artifact.frozen_at || artifact.auction_frozen_at, true)}` : ''}${provenanceText ? ` · ${provenanceText}` : ''}${list(session?.warnings).length ? ` · ${list(session.warnings).join('；')}` : ''}` : state.snapshot?.mode === 'demo' ? '演示模式不展示真实每日评分档案。' : '尚无真实交易日存档。');
+    $('daily-audit-summary').innerHTML = session ? [researchMetric('当日候选 / 可评分', `${num(quality.candidate_count ?? rows.length, 0)} / ${num(quality.scored_count, 0)}`, '固定昨日涨停候选，保留缺观察记录'), researchMetric('结果已知 / 未知', `${rows.filter((row) => typeof row.label === 'boolean').length} / ${rows.filter((row) => typeof row.label !== 'boolean').length}`, '没有完整收盘池，不把未知改成未涨停'), researchMetric('对照时点', session.checkpoint || '—', `${scoreMethod} · ${session.checkpoint === '09:24:50' ? '盘前时点' : '收尾诊断，不混入盘前预测'}`)].join('') : '';
+    $('daily-audit-body').innerHTML = backtestRowsHtml(rows.map((row, index) => ({row, index})), '等待真实竞价与收盘核验记录。');
+  }
+
+  async function loadBacktest() {
+    if (state.backtestBusy || state.snapshot?.mode !== 'live') return;
+    state.backtestBusy = true;
+    state.backtestRequestedId = state.snapshot?.research?.id || '';
+    const mode = state.snapshot.mode;
+    renderBacktestControls();
+    try {
+      const result = await api('/api/research');
+      if (state.snapshot?.mode !== mode) return;
+      state.backtest = result;
+      state.backtestRequestedId = result.id || state.backtestRequestedId;
+      renderBacktestReport();
+    } catch (error) {
+      text('backtest-record', `结果读取失败：${error.message}`);
+      toast(error.message, true);
+    } finally { state.backtestBusy = false; renderBacktestControls(); }
+  }
+
+  async function runBacktest() {
+    const reason = backtestBlockedReason();
+    if (reason) { toast(reason, true); return; }
+    state.backtestRunBusy = true;
+    renderBacktestControls();
+    try {
+      const result = await api('/api/research/run', {});
+      toast(result.message || '已开始回放历史竞价并核对结果。');
+      await fetchState();
+    } catch (error) { toast(error.message, true); }
+    finally { state.backtestRunBusy = false; renderBacktestControls(); }
+  }
+
+  async function importBacktestFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = '';
+    if (!file) return;
+    const reason = backtestBlockedReason();
+    if (reason) { toast(reason, true); return; }
+    state.backtestImportBusy = true;
+    renderBacktestControls();
+    text('backtest-import-status', `正在核验 ${file.name}…`);
+    try {
+      if (file.size > 5 * 1024 * 1024) throw new Error('历史 JSON 不能超过 5 MB，请按交易日分批导入。');
+      let dataset;
+      try { dataset = JSON.parse(await file.text()); } catch { throw new Error('文件不是可读取的 JSON，请参照空白格式模板。'); }
+      if (!dataset || typeof dataset !== 'object' || Array.isArray(dataset)) throw new Error('历史文件顶层必须为 JSON 对象，请参照模板。');
+      if (new Blob([JSON.stringify({dataset})]).size > 5 * 1024 * 1024) throw new Error('提交内容超过 5 MB，请按交易日分批导入。');
+      const result = await api('/api/research/import', {dataset});
+      text('backtest-import-status', result.message || '历史资料已导入。点击「运行本地回测」，按当前算法重新计算。');
+      toast(result.message || '导入完成，可运行本地回测。');
+      await fetchState();
+    } catch (error) { text('backtest-import-status', `未导入：${error.message}`); toast(error.message, true); }
+    finally { state.backtestImportBusy = false; renderBacktestControls(); }
+  }
+
+  function backtestMetricTable(baseline, candidate, caption) {
+    const rows = [['日均前十涨停占比', 'precision', ratio], ['入选股票合计涨停占比', 'pooled_precision', ratio], ['样本池涨停占比', 'pool_base_rate', ratio], ['捕获的涨停占比', 'recall', ratio], ['相对样本池提升倍数', 'lift', (value) => numeric(value) ? `${num(value, 2)} 倍` : '—'], ['有效日期', 'day_count', (value) => num(value, 0)], ['入选股票日 / 涨停数', 'selected_count', (_, data) => `${num(data?.selected_count, 0)} / ${num(data?.hits, 0)}`]];
+    return `<div class="research-section-heading"><h3>${esc(caption)}</h3><span class="subtle">每日取前 min(10, 样本数) 只</span></div><div class="table-scroll"><table class="data-table backtest-metric-table"><thead><tr><th>检验指标</th><th>当前权重</th>${candidate ? '<th>候选权重</th>' : ''}</tr></thead><tbody>${rows.map(([label, key, format]) => `<tr><td>${esc(label)}</td><td>${esc(format(baseline?.[key], baseline))}</td>${candidate ? `<td>${esc(format(candidate[key], candidate))}</td>` : ''}</tr>`).join('')}</tbody></table></div>`;
+  }
+
+  function renderBacktestReport() {
+    const result = state.snapshot?.mode === 'live' ? state.backtest : null;
+    const available = Boolean(result?.id);
+    const labels = {not_run: '尚未运行', insufficient_data: '历史样本不足', completed: '实验已完成', exploratory_holdout_reuse: '重复检验 · 探索性结果', cancelled: '实验已中断'};
+    text('backtest-status', labels[result?.status] || (available ? '已保存实验' : '尚未运行'));
+    text('backtest-record', available ? `${result.generated_at ? `生成于 ${time(result.generated_at, true)} · ` : ''}实验 ${result.id} · 版本 ${result.version || '—'}` : state.snapshot?.mode === 'demo' ? '演示数据不参与真实策略回测。切换实盘后可读取历史实验。' : '尚未运行；已有实时参数保持不变。');
+    const availability = result?.availability || {};
+    $('backtest-availability').innerHTML = [researchMetric('本机真实竞价日期', num(availability.live_batch_days, 0), '只统计实际留存的 live 批次'), researchMetric('导入历史日期', num(availability.imported_days, 0), '外部资料保留来源与时点核验'), researchMetric('完整涨停池日期', num(availability.pool_days, 0), '仅池名单不能重建七因子'), researchMetric('回放会话日期', num(availability.session_days, 0), '合格调参样本另行筛选')].join('');
+    $('backtest-warnings').innerHTML = researchWarnings(result?.warnings);
+    const optimization = result?.optimization || {};
+    const sample = optimization.sample_summary || {};
+    text('backtest-optimization-status', optimization.recommendation?.accepted ? '候选通过本次检验' : labels[optimization.status] || '等待真实样本');
+    $('backtest-optimization-status').className = `pill ${optimization.recommendation?.accepted ? 'green' : 'amber'}`;
+    text('backtest-recommendation', optimization.recommendation?.reason || '没有足够的真实历史竞价，不能选出更优参数。');
+    $('backtest-optimization-metrics').innerHTML = [researchMetric('完整有效日期', `${num(sample.complete_days, 0)} / ${num(sample.required_days ?? 30, 0)}`, '按日期划分训练、滚动验证与保留检验'), researchMetric('完整股票日', `${num(sample.complete_rows, 0)} / ${num(sample.required_rows ?? 300, 0)}`, '七因子齐全且收盘结果已核验'), researchMetric('涨停 / 未涨停结果', `${num(sample.positive_count, 0)} / ${num(sample.negative_count, 0)}`, `此处为全样本；开发集两类各须至少 ${num(sample.required_class_rows ?? 30, 0)} 个，未知排除`)].join('');
+    const search = optimization.search || {};
+    const dateRange = (dates) => list(dates).length ? `${list(dates)[0]} 至 ${list(dates)[list(dates).length - 1]}（${list(dates).length} 日）` : '尚未划分';
+    $('backtest-partitions').innerHTML = search.development_dates ? `<div><span>较早日期 · 参数开发</span><strong>${esc(dateRange(search.development_dates))}</strong></div><div><span>较晚日期 · 保留检验</span><strong>${esc(dateRange(search.holdout_dates))}</strong></div><p>候选参数 ${esc(num(search.candidate_count, 0))} 组 · 滚动验证 ${esc(num(list(search.folds).length, 0))} 轮。保留期只评价选定参数，不参与选择。</p>` : '';
+    const holdout = optimization.holdout;
+    $('backtest-holdout').innerHTML = holdout ? backtestMetricTable(holdout.baseline, holdout.candidate, '较晚日期的独立检验') + `<p class="research-note backtest-quality">日均前十涨停占比变化 ${esc(numeric(holdout.precision_delta_pp) ? `${Number(holdout.precision_delta_pp) > 0 ? '+' : ''}${num(holdout.precision_delta_pp, 2)} 个百分点` : '未知')} · 胜过当前权重的日期占比 ${esc(ratio(holdout.positive_gain_day_ratio))}。${result?.status === 'exploratory_holdout_reuse' ? '这份保留样本已经使用过，本次结果只作探索，不能视为新的独立验证。' : '一次通过不代表未来收益，也不代表已验证成交可行性。'}</p>` : optimization.baseline?.day_count ? backtestMetricTable(optimization.baseline, null, '当前权重在已有合格样本中的表现') : '';
+    const candidate = optimization.candidate_weights;
+    $('backtest-weight-comparison').innerHTML = candidate ? `<div class="research-section-heading"><h3>本次候选权重</h3><span class="subtle">保留建议，未修改实时策略</span></div><div class="table-scroll"><table class="data-table backtest-metric-table"><thead><tr><th>竞价因子</th><th>当前权重</th><th>候选权重</th></tr></thead><tbody>${Object.entries(factors).map(([key, value]) => `<tr><td>${esc(value.label)}</td><td>${esc(ratio(result.baseline_weights?.[key]))}</td><td>${esc(ratio(candidate[key]))}</td></tr>`).join('')}</tbody></table></div>` : '<p class="research-note backtest-no-candidate">当前没有可供采用的新权重；继续保留现有配置。</p>';
+    const diagnostics = list(optimization.factor_diagnostics);
+    const missing = sample.missing_factors || {};
+    $('backtest-factor-diagnostics').innerHTML = Object.keys(missing).length || diagnostics.length ? `<details class="backtest-factor-section"><summary>因子贡献实验与缺失统计</summary><p class="research-note">单因子与移除因子实验只在较早的开发日期比较；不反复利用保留期挑选因子。占比单位为百分数。</p><div class="table-scroll"><table class="data-table backtest-factors-table"><thead><tr><th>因子</th><th>缺失股票日</th><th>单因子验证前十涨停占比</th><th>移除后验证占比变化</th></tr></thead><tbody>${Object.entries(factors).map(([key, info]) => {
+      const item = diagnostics.find((entry) => entry.factor === key);
+      const delta = item?.without_factor?.validation_precision_delta;
+      return `<tr><td>${esc(info.label)}</td><td>${esc(num(item?.missing_rows ?? missing[key], 0))}</td><td>${esc(ratio(item?.single_factor?.validation?.precision))}</td><td>${esc(numeric(delta) ? `${Number(delta) > 0 ? '+' : ''}${num(Number(delta) * 100, 2)} 个百分点` : '尚未实验')}</td></tr>`;
+    }).join('')}</tbody></table></div></details>` : '';
+    $('backtest-optimization-warnings').innerHTML = researchWarnings(optimization.warnings);
+    const sessions = list(result?.sessions);
+    $('backtest-session').innerHTML = sessions.length ? sessions.map((session, index) => `<option value="${index}" data-session-key="${esc(`${session.date}|${session.checkpoint}`)}">${esc(session.date)} · ${esc(session.checkpoint)}${session.checkpoint === '09:24:50' ? ' · 盘前检验' : ' · 收尾对照'}</option>`).join('') : '<option value="">暂无真实回放</option>';
+    const retainedIndex = sessions.findIndex((session) => `${session.date}|${session.checkpoint}` === state.backtestSessionKey);
+    $('backtest-session').value = sessions.length ? String(retainedIndex >= 0 ? retainedIndex : sessions.findIndex((session) => session.checkpoint === '09:24:50') >= 0 ? sessions.findIndex((session) => session.checkpoint === '09:24:50') : 0) : '';
+    $('backtest-session').disabled = !sessions.length;
+    renderBacktestSession();
+    const transitions = list(result?.transitions?.rows);
+    $('backtest-transitions-body').innerHTML = transitions.length ? transitions.map((row) => `<tr><td>${esc(row.date)}</td><td>${esc(row.previous_date)}</td><td>${esc(num(row.yesterday_count, 0))}</td><td>${esc(num(row.repeat_count, 0))}</td><td><div class="backtest-rate"><span style="width:${clamp(row.repeat_rate_pct)}%"></span><strong>${esc(pctValue(row.repeat_rate_pct))}</strong></div></td></tr>`).join('') : '<tr><td colspan="5" class="table-empty">没有可核验的相邻完整涨停池；缺失不补零。</td></tr>';
+    renderBacktestControls();
+  }
+
+  function backtestRowsHtml(rows, emptyMessage) {
+    return rows.length ? rows.map(({row, index}) => {
+      const label = row.label === true ? '<span class="pill green">是</span>' : row.label === false ? '<span class="pill">否</span>' : '<span class="pill amber">未知</span>';
+      const factorHtml = Object.entries(factors).map(([key, info]) => `<span><em>${esc(info.label)}</em><strong>${esc(num(row.factors?.[key]?.score, 1))}</strong></span>`).join('');
+      const flags = list(row.quality?.flags);
+      return `<tr><td>${numeric(row.score) ? esc(num(index + 1, 0)) : '—'}</td><td><strong class="stock-name">${esc(row.name || row.thscode)}</strong><span class="stock-code">${esc(row.thscode)}</span></td><td>${esc(num(row.score, 2))}</td><td>${esc(ratio(row.quality?.factor_coverage))}</td><td>${label}</td><td><details class="backtest-row-factors"><summary>展开七因子${flags.length ? ` · ${esc(flags.length)} 项提示` : ''}</summary><div>${factorHtml}</div>${flags.length ? `<p>${esc(flags.join('；'))}</p>` : ''}</details></td></tr>`;
+    }).join('') : `<tr><td colspan="6" class="table-empty">${esc(emptyMessage)}</td></tr>`;
+  }
+
+  function renderBacktestSession() {
+    const session = state.snapshot?.mode === 'live' && $('backtest-session').value !== '' ? list(state.backtest?.sessions)[Number($('backtest-session').value)] : null;
+    state.backtestSessionKey = session ? `${session.date}|${session.checkpoint}` : '';
+    const quality = session?.quality || {};
+    $('backtest-session-metrics').innerHTML = session ? [researchMetric('盘前候选 / 已观察', `${num(quality.candidate_count, 0)} / ${num(quality.observed_count, 0)}`, '先确定候选，后核对收盘结果'), researchMetric('可评分 / 未观察', `${num(quality.scored_count, 0)} / ${num(quality.unobserved_count, 0)}`, '未观察或无效分数不变成零分'), researchMetric('优化样本资格', quality.eligible_for_optimization === true ? '可进入筛选' : '仅作诊断', '还需满足七因子、完整日期与样本门槛')].join('') : '';
+    text('backtest-session-quality', session ? `盘前背景 ${quality.context_verified === true ? '已核验' : '未完整核验'} · 同日结果池 ${quality.outcome_verified === true ? '已核验' : '未完整核验'}${list(session.warnings).length ? ` · ${list(session.warnings).join('；')}` : ''}` : '尚无可回放的真实会话。');
+    const search = $('backtest-stock-search').value.trim().toLowerCase();
+    const allRows = list(session?.rows);
+    const rows = allRows.map((row, index) => ({row, index})).filter(({row}) => !search || `${row.name || ''} ${row.thscode || ''}`.toLowerCase().includes(search));
+    $('backtest-stocks-body').innerHTML = backtestRowsHtml(rows, session ? search ? '没有匹配的名称或股票代码。' : '本时点没有可展示的候选记录。' : '尚无可回放的真实竞价记录。涨停池名单不能代替历史竞价序列。');
+    text('backtest-stock-count', session ? `${session.date} ${session.checkpoint} · 显示 ${rows.length} / ${allRows.length} 只候选` : '股票代码保留交易所后缀与前导零');
+  }
+
   const researchStatus = (status) => ({ready: '已取得', partial: '部分数据', unavailable: '尚不可用', cancelled: '已中断'}[status] || '未补充');
   const pctValue = (value) => numeric(value) ? `${num(value, 1)}%` : '—';
   const researchMetric = (label, value, note) => `<div class="research-metric"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`;
@@ -944,6 +1212,7 @@
     $('api-cooldown').classList.toggle('hidden', !limited);
     text('api-cooldown-text', remaining > 0 ? `约 ${num(remaining, 0)} 秒后可恢复请求；同一 Key 的后台请求同步暂停，已有观测继续保留。` : '冷却时间已到，等待服务确认；已有观测继续保留。');
     renderOfficialControls();
+    renderBacktestControls();
     text('clock', time(new Date().toISOString()));
     const auction = state.snapshot?.auction || {};
     const latest = auction.summary?.last_received_at || list(auction.rows).reduce((last, row) => row.updated_at && (!last || row.updated_at > last) ? row.updated_at : last, '');
@@ -1028,6 +1297,10 @@
   });
   $('symbol-search').addEventListener('input', (event) => { state.search = event.target.value.trim().toLowerCase(); renderAuction(); });
   $('watchlist').addEventListener('input', () => { state.watchlistSettingsDirty = true; });
+  for (const id of ['auto-review', 'review-time']) $(id).addEventListener('input', () => {
+    state.runtimeScheduleDirty = true;
+    state.runtimeScheduleRevision = (state.runtimeScheduleRevision || 0) + 1;
+  });
   $('review-date').addEventListener('input', () => { state.reviewDateTouched = true; });
   $('report-save').addEventListener('click', saveMarkdown);
   $('report-load').addEventListener('click', loadSavedReport);
@@ -1037,6 +1310,15 @@
   $('comparison-run').addEventListener('click', compareReports);
   $('diagnostics-refresh').addEventListener('click', loadDiagnostics);
   $('official-enrich').addEventListener('click', enrichReport);
+  $('backtest-refresh').addEventListener('click', loadBacktest);
+  $('backtest-run').addEventListener('click', runBacktest);
+  $('backtest-session').addEventListener('change', renderBacktestSession);
+  $('backtest-stock-search').addEventListener('input', renderBacktestSession);
+  $('backtest-import-button').addEventListener('click', () => { if (!backtestBlockedReason()) $('backtest-import-file').click(); });
+  $('backtest-import-file').addEventListener('change', importBacktestFile);
+  $('daily-audit-refresh').addEventListener('click', loadDailyAudits);
+  $('daily-audit-date').addEventListener('change', loadDailyAudit);
+  $('daily-audit-checkpoint').addEventListener('change', renderDailyAuditRows);
   window.addEventListener('hashchange', () => showPage(location.hash.slice(1) || 'auction'));
   $('toggle-errors').addEventListener('click', () => { const closed = $('errors-list').classList.toggle('hidden'); text('toggle-errors', closed ? '展开' : '收起'); });
   $('weights-editor').addEventListener('input', (event) => {
@@ -1071,8 +1353,15 @@
     const savedWatchlist = state.snapshot?.config?.watchlist || [];
     const added = watchlist.filter((code) => !savedWatchlist.includes(code));
     if (added.length) { $('watchlist-batch').value = added.join(', '); showPage('stocks'); toast('新增代码需要核验，已带入个股查询页的批量自选输入框；采集设置尚未保存。'); return; }
-    const ok = await mutate('/api/config', {universe: $('universe').value, poll_seconds: Number($('poll-seconds').value), watchlist}, '采集设置已保存', event.submitter);
-    if (ok) state.watchlistSettingsDirty = false;
+    const reviewTime = $('review-time').value;
+    if (!/^15:[1-5]\d$/.test(reviewTime)) { toast('自动收盘时间须为上海时间 15:10—15:59。', true); return; }
+    const scheduleRevision = state.runtimeScheduleRevision || 0;
+    const ok = await mutate('/api/config', {universe: $('universe').value, poll_seconds: Number($('poll-seconds').value), watchlist, auto_review: $('auto-review').checked, review_time: reviewTime}, '采集设置已保存', event.submitter);
+    if (ok) {
+      state.watchlistSettingsDirty = false;
+      if ((state.runtimeScheduleRevision || 0) === scheduleRevision) state.runtimeScheduleDirty = false;
+      renderReviewSchedule(state.snapshot || {});
+    }
   });
   $('weights-form').addEventListener('submit', async (event) => {
     event.preventDefault();

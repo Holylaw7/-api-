@@ -1,6 +1,6 @@
 # 架构与二次开发
 
-版本1.4。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`，新增用户流程见 `docs/OFFICIAL_UPGRADE.md`。
+版本1.5。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
 
 ## 模块与数据流
 
@@ -20,6 +20,10 @@ report_library.py ↔ storage.py / 报告JSON → reporting.py → Markdown保�
 insights.py → 两期报告比较 / 本机就绪检查（不请求行情）
 sentiment.py → 留存完整池的情绪结构（不请求行情）
 official_context.py → 手动、显式日期的风向标 / 龙虎榜 → 新版本报告
+daily_validation.py → 当日两时点评分冻结 → 收盘结果核验 → 每日版本档案
+research_data.py → 有界历史JSON导入 → research.py → replay.py → AuctionEngine
+                                              ↓
+                                      optimization.py → 参数建议 / 实验JSON与Markdown
 ```
 
 全项目 Python 标准库，前端原生 HTML/CSS/JS，无第三方 CDN。Windows 使用固定 UTC+08:00（Asia/Shanghai 现代交易时区），不依赖系统时区数据库。所有入库时间包含偏移。
@@ -180,6 +184,28 @@ Service分开维护`review`、`latest_review`和`viewing_archive`。前者只代
 限流采用同进程同Key共享冷却：HTTP429或业务4001记录下一可尝试时点，后续请求在冷却中快速返回受控错误，已有状态和SSE继续。Service另把已知冷却计入竞价调度，公开`api.rate_limited/cooldown_seconds`供页面显示。常规错误仍有有界重试；解析Retry-After是HTTP工程兼容，不是官网承诺。超过15秒的等待不会被截短成15秒再马上重试，而由调用方以后处理。竞价本身仍禁内部重试，冷却不改变逐批落盘、评分和发布顺序。
 
 本轮复用入口是`sentiment.build_sentiment`与`official_context.build_official_context`，后者要求兼容`HiThinkProvider.get`且已校验HTTP200/code0的数据适配器。增改字段要同步CONTRACT、Markdown、页面、LLM白名单与临时夹具测试；官方参考资料位于ignored work目录，不能成为程序启动依赖。
+
+## 历史研究与每日核验（1.5）
+
+采集关键路径继续为逐批响应、原始保存、引擎更新和状态发布，模型与历史搜索不进入此路径。新批次保存 `_strategy_weights`；首次准备的日期、官方日历、完整前日池、采集范围与权重以 `INSERT OR IGNORE` 写入 `research_manifests`，之后重启或结果池不会覆盖当日盘前证据。两个固定截止时点保存引擎原排名到 `research_decisions`；遇下一批跨越截止时点，须先固定只含截止前数据的排名，再摄入该批。
+
+`daily_validation.py` 在 09:27 后整理 09:24:50 与 09:26:00 档案。存在当时的时点排名时直接保留，标 `method=recorded_ranking`；没有时点排名但有原记录权重时，按所标识引擎回放，标 `method=replayed`。两时点可能不同来源；旧权重回退另有 `legacy_fallback`，不将重放值伪装为实时日志。`*-auction.json` 只写一次，收盘核验深复制后加标签并形成独立版本，不重算、覆盖冻结分数。
+
+运行中的官方交易日自动调度 09:27 日档；开启 `auto_review` 后，在配置时间（默认 15:10）生成收盘复盘，再尝试匹配同日完整涨停池并启动本机研究。手动复盘亦会尝试核验；缺盘前清单、批次或原权重则 unavailable。保护时段和退出取消继续有效，自动任务不是硬性时刻保证，停机期间未采的数据不能恢复。
+
+`research_data.validate_import` 对外部 JSON 作白名单、代码、时区、接收顺序、日期、单位与完整池声明验证；不请求网络、不补缺字段。HTTP 上限 5 MiB，每批文件最多 40 日，导入目录总计最多 120 日；导入与本机实盘同日冲突、导入版本冲突均拒绝覆盖。完整格式见 [BACKTEST.md](BACKTEST.md)。
+
+`replay.replay_session` 是纯计算：原候选固定为昨日完整涨停池，过滤截止后批次，按留存顺序调用 `AuctionEngine`；结果池仅加入布尔标签。迟到准备或事后恢复上下文标 `reconstructed`，不能进入严格优化。`pool_transitions` 只在日历上相邻的完整池计算延续率与前五日背景，缺日期不跨越、不补零。
+
+`optimization.optimize_sessions` 只接收合格的 09:24:50 会话。共同七因子完整样本至少 30 日、300 股日，开发集正负各至少 30；按日期三折验证，末尾 20% 至少 5 日只作一次检验。最多 64 组确定性权重实验，基线与候选的样本完全一致。此模块不取数、不写配置，候选建议不会自动应用。
+
+`research.ResearchLibrary` 负责有界读取最近最多 120 日、每日本机最多 5,000 批，编排纯计算与归档。数据、源码与权重摘要组成 24 位十六进制实验 ID；相同输入复用实验。`holdouts.json` 保存已使用检验日期，复用时只标探索并拒绝接受建议。每个实验的 JSON/Markdown、开发/保留日期、固定种子、质量、指纹和缺失说明保留，修改当前参数不改过去证据。
+
+`GET /api/research` 与独立下载返回完整结果，SSE 只增加 `research:{id,status,generated_at}` 与任务进度，避免每批推送大体积历史数据。`GET /api/research/daily` 提供目录或按日期读取；`GET /api/research/history?date=YYYY-MM-DD` 只读本机原始真实批次、清单和已知结果，按导入字段白名单导出。原始历史查询最多 5,000 批，保护时段拒绝这类重导出；缺结果池时 `outcome=null`，可供审计但不能直接作为完整导入文件。
+
+`GET /api/research/ai-dataset?id=...` 只发开发日期，不给保留标签；开发不足可为空。`POST /api/research/proposals` 只归档七因子有限非负权重、模型来源、理由及实验/数据摘要，状态为 `awaiting_future_validation`。完整每日/实验/原始历史导出可能含保留期结果，不应用来继续自动调参。系统不隐式调用模型，也不自动将建议加入当前搜索或实盘配置；后续验证须使用新日期。
+
+新增接口完整请求约束以 `CONTRACT.md` 为准。新增研究文件均在 `data/research/`，原始批次留在 SQLite，不因迭代实验清理；源码指纹不是源码备份，严格复现还应保存对应 Git 提交。
 
 ## 独立 AI 应用（1.2）
 

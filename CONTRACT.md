@@ -214,3 +214,25 @@ Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summa
 聊天提交时复制配置、当前provider历史及可选摘要。结果回写提交时provider，不受之后切换影响。HTTP已有任务运行时返回started=false；任务中的接口错误只返回安全摘要。主系统AI结果也按provider保存，切换不会把另一家的结果显示成当前模型生成。
 
 生成和清空请求显式传页面当前provider，避免另一个窗口改变全局选择后、轮询尚未刷新的短窗口错误路由。缺provider的旧客户端才采用当前全局选择。
+# 1.5 历史研究与每日核验接口补充
+
+以下接口仅本机使用；POST继承`Host/Origin/X-Local-App: auction-lab`检查。GET不调用金融API或LLM。原有契约继续有效。
+
+| 接口 | 请求 / 响应 |
+|---|---|
+| GET `/api/research` | 最近实验对象，未运行为`{status:"not_run"}`。含availability、transitions、sessions、optimization、warnings、reproducibility。 |
+| POST `/api/research/run` | `{}`；后台research任务，返回ok/message/started。保护时段或demo拒绝。 |
+| GET `/api/research/export?id=<24hex>&format=markdown\|json` | 不可变实验下载，id可省略取最近，禁止路径输入。实验本身已经自动保存。 |
+| GET `/api/research/template` | schema_version=1空模板及字段说明，不含行情。 |
+| POST `/api/research/import` | `{dataset:{schema_version,provenance,sessions}}`；最多5MiB/40日，每日5000批/每批100股，累计120日。日期不可覆盖或与本机live混用；返回import_id/imported_days。 |
+| GET `/api/research/daily` | `{items:[...]}`每日档案目录。 |
+| GET `/api/research/daily?date=YYYY-MM-DD` | 最近核验版本，否则冻结竞价档；无档为unavailable。sessions区分method=recorded_ranking/replayed。 |
+| GET `/api/research/daily/export?date=...&format=markdown\|json` | 下载日档，无档不造报告。 |
+| GET `/api/research/history?date=...` | 真实本机清单＋原始竞价序列白名单＋结果池；无清单/批次拒绝；结果池缺失为null。保护时段拒绝。 |
+| GET `/api/research/ai-dataset?id=<24hex>` | schema_version=1，scope=development_only，仅开发日期09:24:50、合格来源的rows/factors/label；不含保留日期明细或09:26终态。数据不足可能sessions为空。 |
+| POST `/api/research/proposals` | `{experiment_id,weights:{全部七键},source_model?,rationale?}`；仅归档，返回proposal_id/status=awaiting_future_validation/automatically_applied=false。不改配置、不调用付费模型。 |
+| GET `/api/research/proposals` | 最近最多100份待验证参数建议，供继续研究追溯；不代表已通过验证。 |
+
+其余POST仍为64KiB上限。所有证券代码均为六位字符串加.SH/.SZ/.BJ；不从裸代码猜市场。导入provenance须明确观察时间、元金额、百分数单位和`point_in_time_attested=true`，不等于程序认证外部历史真实性。完整导入细节见`docs/BACKTEST.md`。
+
+`/api/state.research`仅含id/status/generated_at，不把全实验随SSE广播。每日自动核验在15:10后的收盘复盘完成后触发；核验失败单独报告，不抹去已完成的复盘。原始SQLite、竞价日档、实验JSON、Markdown及建议档案在本机data目录隔离保存。优化结果最多说明此数据和预设规则下的比较，不输出交易收益承诺。

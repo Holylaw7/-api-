@@ -8,7 +8,9 @@ from urllib.parse import parse_qs, urlsplit, urlencode
 
 from .config import ROOT, finance_key, save_finance_key
 from .ai_gateway import save_profile, select_provider
-from .service import Service
+from .service import Service, now_sh
+from .research_data import MAX_IMPORT_BYTES, import_template
+from .report_library import valid_date
 
 
 class LocalServer(ThreadingHTTPServer):
@@ -71,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
         service = self.server.service
         try:
             if path == '/api/health':
-                self._json({'ok':True,'application':'auction-lab','version':'1.4.0'})
+                self._json({'ok':True,'application':'auction-lab','version':'1.5.0'})
             elif path == '/api/state':
                 self._json(service.snapshot())
             elif path == '/api/events':
@@ -131,6 +133,42 @@ class Handler(BaseHTTPRequestHandler):
                 self._markdown(data, filename)
             elif path == '/api/diagnostics':
                 self._json(service.diagnostics())
+            elif path == '/api/research':
+                self._json(service.research_library.latest())
+            elif path == '/api/research/template':
+                self._json(import_template(),attachment='auction-history-template.json')
+            elif path == '/api/research/proposals':
+                self._json(service.research_library.proposals())
+            elif path == '/api/research/ai-dataset':
+                query = parse_qs(urlsplit(self.path).query)
+                self._json(service.research_library.ai_dataset(query.get('id',[None])[0]),attachment='auction-development-data.json')
+            elif path == '/api/research/history':
+                if service._auction_priority():
+                    raise ValueError('原始历史序列导出请避开09:10–09:26竞价保护时段')
+                query = parse_qs(urlsplit(self.path).query)
+                day = valid_date(query.get('date',[None])[0])
+                self._json(service.research_library.historical_dataset(day,now_sh()),attachment='auction-history-'+day+'.json')
+            elif path == '/api/research/export':
+                query = parse_qs(urlsplit(self.path).query)
+                format_name = query.get('format',['markdown'])[0]
+                filename, content = service.research_library.export(query.get('id',[None])[0],format_name)
+                if format_name == 'markdown':
+                    self._markdown(content,filename)
+                else:
+                    self._json(content,attachment=filename)
+            elif path == '/api/research/daily':
+                query = parse_qs(urlsplit(self.path).query)
+                date = query.get('date',[None])[0]
+                self._json(service.daily_validation.get(valid_date(date)) if date else {'items':service.daily_validation.list()})
+            elif path == '/api/research/daily/export':
+                query = parse_qs(urlsplit(self.path).query)
+                date = valid_date(query.get('date',[None])[0])
+                format_name = query.get('format',['markdown'])[0]
+                filename, content = service.daily_validation.export(date,format_name)
+                if format_name == 'markdown':
+                    self._markdown(content,filename)
+                else:
+                    self._json(content,attachment=filename)
             else:
                 files = {'/':'index.html','/index.html':'index.html','/style.css':'style.css','/app.js':'app.js',
                          '/static/style.css':'style.css','/static/app.js':'app.js'}
@@ -162,8 +200,9 @@ class Handler(BaseHTTPRequestHandler):
             return
         service = self.server.service
         try:
+            path = urlsplit(self.path).path
             length = int(self.headers.get('Content-Length','0'))
-            if length < 0 or length > 65536:
+            if length < 0 or length > (MAX_IMPORT_BYTES if path == '/api/research/import' else 65536):
                 self._json({'ok':False,'message':'请求过大'},413)
                 return
             body = json.loads(self.rfile.read(length) or b'{}')
@@ -187,6 +226,19 @@ class Handler(BaseHTTPRequestHandler):
             elif path == '/api/review':
                 started = service.run_review(body.get('date') or None)
                 message = '复盘任务已开始' if started else '已有复盘任务正在运行'
+            elif path == '/api/research/run':
+                started = service.run_research()
+                message = '正在本机重放历史竞价并对照收盘结果' if started else '已有回测任务正在运行'
+            elif path == '/api/research/import':
+                result = service.import_research(body.get('dataset'))
+                self._json(dict(result,ok=True))
+                return
+            elif path == '/api/research/proposals':
+                if service.mode != 'live' or service._auction_priority():
+                    raise ValueError('参数建议归档须在实盘模式与竞价保护时段外进行')
+                result = service.research_library.save_proposal(body,now_sh())
+                self._json(dict(result,ok=True,message='参数建议已归档，未更改实盘权重；需要新的日期验证'))
+                return
             elif path == '/api/reports/load':
                 service.load_report(body.get('date'))
                 message = '已读取本机历史报告，未重新请求行情'

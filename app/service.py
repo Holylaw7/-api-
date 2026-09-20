@@ -1,10 +1,12 @@
 import copy
+import hashlib
 import json
 import math
 import re
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from .config import DATA, atomic_json, finance_key, credential_status, load_config, validate_config
 from .ai_gateway import active_config as load_llm, profiles_state, test_connection, AIGatewayError
@@ -19,6 +21,9 @@ from .reporting import report_identity
 from .insights import compare_reports, readiness
 from .sentiment import build_sentiment
 from .official_context import build_official_context
+from .research import ResearchLibrary, CHECKPOINTS
+from .research_data import pool_rows
+from .daily_validation import DailyValidation
 
 SH = timezone(timedelta(hours=8), name='Asia/Shanghai')
 
@@ -47,6 +52,16 @@ class Service:
         self.engine = AuctionEngine(self.config['weights'])
         self.store = Store(self.data_dir / 'market.sqlite3')
         self.report_library = ReportLibrary(self.store, self.data_dir)
+        self.research_library = ResearchLibrary(self.store, self.data_dir)
+        self.daily_validation = DailyValidation(self.store, self.data_dir)
+        try:
+            research = self.research_library.latest()
+        except ValueError:
+            research = {'status':'not_run'}
+        self.research_summary = {k:research.get(k) for k in ('id','status','generated_at')}
+        self.last_daily_attempt = None
+        self.recorded_decisions = set()
+        self.engine_source_sha256 = hashlib.sha256((Path(__file__).parent/'engine.py').read_bytes()).hexdigest()
         self.lock = threading.RLock()
         self.condition = threading.Condition(self.lock)
         self.version = 0
@@ -207,6 +222,7 @@ class Service:
                                      trend_pool=self._public_report(self.trend_pool) if self.mode == 'live' else {}),
                          review=self._public_report(self.review), review_id=self._review_identity(),
                          review_sentiment=self._review_sentiment(), api=self._api_status(), jobs=self.jobs, config=self.config,
+                         research=self.research_summary,
                          llm=dict(**ai_state, configured=active['configured'], base_url=active['base_url'],
                                   model=active['model'], label=active['label'],
                                   result=self.llm_results.get(active['id']),
@@ -666,6 +682,60 @@ class Service:
             raise ValueError('请先启动实盘服务再准备关注池；演示与实盘数据不能混用')
         return self._job('prepare', self._prepare)
 
+    def run_research(self):
+        if self.mode != 'live':
+            raise ValueError('请切回实盘模式；演示记录不能用于历史优化')
+        if self._auction_priority():
+            raise ValueError('09:10–09:26优先采集竞价，请稍后进行历史回放')
+        with self.lock:
+            weights = dict(self.config['weights'])
+            generation = self.demo_generation
+        def work():
+            result = self.research_library.run(weights,now_sh(),
+                should_stop=lambda:self.shutdown.is_set() or self._auction_priority() or self.mode != 'live' or self.demo_generation != generation,
+                progress=lambda text:self._progress('research',text))
+            with self.lock:
+                self.research_summary = {k:result.get(k) for k in ('id','status','generated_at')}
+        return self._job('research',work)
+
+    def import_research(self, dataset):
+        if self.mode != 'live' or self._auction_priority():
+            raise ValueError('历史导入仅限实盘模式且须避开09:10–09:26竞价保护时段')
+        with self.lock:
+            if self.jobs.get('research',{}).get('status') == 'running':
+                raise ValueError('请等待当前回测完成后导入历史数据')
+        return self.research_library.import_dataset(dataset,now_sh())
+
+    def _freeze_daily(self, date):
+        with self.lock:
+            self._capture_due_decisions(now_sh())
+        def work():
+            self.daily_validation.freeze(date,now_sh(),should_stop=lambda:self.shutdown.is_set() or self._auction_priority())
+        return self._job('daily_validation',work)
+
+    def _capture_due_decisions(self, captured_at):
+        """Called with the collection lock before ingesting a later observation.
+
+        At most two small ranking snapshots per day. Never time-travel an engine
+        which has already consumed data after the decision cutoff.
+        """
+        day = captured_at.date().isoformat()
+        if self.mode != 'live' or self.session_date != day or self.engine.session_date != day:
+            return
+        for checkpoint in CHECKPOINTS:
+            key = (day,checkpoint)
+            cutoff = datetime.fromisoformat(day+'T'+checkpoint+'+08:00')
+            if key in self.recorded_decisions or captured_at <= cutoff:
+                continue
+            last = self.engine._last_received
+            if last is None or last > cutoff:
+                continue
+            rows = self.engine.rankings(cutoff)
+            self.store.freeze_decision(day,checkpoint,dict(date=day,checkpoint=checkpoint,mode='live',
+                captured_at=captured_at.isoformat(),weights=dict(self.engine.weights),rows=rows,
+                engine_source_sha256=self.engine_source_sha256))
+            self.recorded_decisions.add(key)
+
     def _prepare(self):
         provider = self._provider()
         today = now_sh().date().isoformat()
@@ -695,6 +765,13 @@ class Service:
             self.prepared_date = today
             self._rebuild_codes()
             codes = self.codes[:]
+            if today in days:
+                prepared = now_sh()
+                clean_context = pool_rows(list(context.values()))
+                self.store.freeze_manifest(dict(date=today,mode='live',prepared_at=prepared.isoformat(),
+                    previous_date=previous,calendar=days,context={r['thscode']:r for r in clean_context},
+                    codes=codes,context_complete=True,point_in_time=prepared.strftime('%H:%M:%S') <= '09:15:00',
+                    source='local_preparation',weights=dict(self.config['weights'])))
             if new_session:
                 self.engine.reset()
                 self.provisional_rows.clear()
@@ -760,6 +837,8 @@ class Service:
             with self.lock:
                 if generation != self.demo_generation or self.mode != 'live':
                     break
+                self._capture_due_decisions(received)
+                data['_strategy_weights'] = dict(self.engine.weights)
                 self.store.batch(self.session_date, 'live', received.isoformat(), stage, data)
                 ranked = self.engine.ingest(data, received, self.context)
                 if stage == 'live':
@@ -817,6 +896,20 @@ class Service:
                 if eligible and chosen == eligible[-1]:
                     self.trend_refresh_needed = True
                     self.last_trend_attempt = None
+            # Original observations/ranks are immutable; close-time labels create
+            # a separate local artifact and never feed the live auction engine.
+            matched_at = now_sh()
+            if matched_at >= datetime.fromisoformat(chosen+'T15:10:00+08:00'):
+                try:
+                    daily = self.daily_validation.label(report,matched_at,
+                        should_stop=lambda:self.shutdown.is_set() or self._auction_priority())
+                    if daily.get('status') != 'unavailable' and not self._auction_priority():
+                        self.run_research()
+                except Exception as exc:
+                    safe = str(exc) if isinstance(exc,ValueError) else '每日竞价核验未完成，已生成的收盘复盘仍保留'
+                    with self.lock:
+                        self.jobs['daily_validation'] = dict(status='error',message=safe)
+                    self.error(safe)
         return self._job('review', work)
 
     def _save_markdown(self, report):
@@ -984,10 +1077,15 @@ class Service:
                 if current > boundary+timedelta(seconds=self.config['final_grace_seconds']) and not self.finalized:
                     with self.lock:
                         self.message = f'竞价窗口已结束。已收集 {len(self.processed)}/{len(self.codes)} 只，终态 {len(self.final_codes)}/{len(self.codes)}；缺失数据未补造'
+                if current.strftime('%H:%M') >= '09:27' and self.last_daily_attempt != today:
+                    self.last_daily_attempt = today
+                    self._freeze_daily(today)
                 if (self.config['auto_review'] and current.strftime('%H:%M') >= self.config['review_time']
                         and self.last_review_attempt != today and self.jobs.get('evidence', {}).get('status') != 'running'):
                     self.last_review_attempt = today
-                    if not self.latest_review or self.latest_review.get('date') != today or self.latest_review.get('status') != 'ready':
+                    if (not self.latest_review or self.latest_review.get('date') != today
+                            or self.latest_review.get('status') != 'ready'
+                            or self.latest_review.get('generated_at','') < today+'T15:10:00'):
                         self.run_review(today, automatic=True)
             except Exception as exc:
                 safe = str(exc) if isinstance(exc,ValueError) or exc.__class__.__name__ == 'APIError' else type(exc).__name__+'：采集失败'
