@@ -104,11 +104,13 @@ state = {
  review:null|report, review_id:null|sha256, review_sentiment:null|sentiment,
  sector_research:{evidence_id,date,review_id,status,generated_at}|{},
  api:{rate_limited:boolean,cooldown_seconds:number}, jobs:{}, config:publicConfig,
+ finance:{provider,base_url,configured,credential_source,persisted,test,can_save,save_block_reason,can_test,test_block_reason},
+ research:{id?,status,generated_at?},
  llm:{active_provider,profiles,configured,base_url,model,label,result,connection_test},errors:[]
 }
 ```
 
-公开calendar.dates只显示最近15个交易日，不能当作筛选/均线所需完整日历。jobs以prepare/review/evidence/sectors/llm/llm_test/stock/watchlist/trends等为键，值为`{status:'running'|'done'|'error',message}`。job完成不代表数据完整：板块证据可为partial/unavailable，保护时段个股analysis.status可以为deferred。api冷却为本机已知的剩余等待，不代表外部服务保证恢复时间。
+公开calendar.dates只显示最近15个交易日，不能当作筛选/均线所需完整日历。jobs以prepare/review/evidence/sectors/llm/llm_test/stock/watchlist/trends/research/daily_validation/finance_test等为键，值为`{status:'running'|'done'|'error',message}`。POST返回`started=true`仅表示后台任务已创建；调用方须等对应job为done后读取结果。任务error时旧成功档案仍可能存在，不能冒充本轮结果。job完成也不代表数据完整：板块证据可为partial/unavailable，保护时段个股analysis.status可以为deferred。api冷却为本机已知的剩余等待，不代表外部服务保证恢复时间。
 
 竞价rows含`rank,thscode,name,score,factors,quality,auction_pct,auction_amount,updated_at,phase,sources`；公开状态去掉raw和大体积历史，详细本机轨迹另取。
 
@@ -226,6 +228,7 @@ Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summa
 - 演示拒绝真实查询/自选变更/趋势刷新，不能将真实个股或趋势池显示为演示信号。
 - 原生中文前端无CDN；保持查询/加入关注分开，显示日线日期、竞价日期、模式、质量及评分口径。
 - unittest使用自包含夹具、临时目录；真实认证、真实交易时段和离线边界测试的验收分别记录。修改同步README、策略、数据源、架构、AGENTS及本契约。
+- 面向其他AI的执行入口为`docs/AI_MAINTENANCE.md`，全部本机端点和内部扩展接口见`docs/API_REFERENCE.md`，每日数据到外部参数建议的治理流程见`docs/CONTINUOUS_OPTIMIZATION.md`。接口简表与详细文档必须同次更新。
 
 ## 独立助手 HTTP（1.2，端口8766）
 
@@ -271,3 +274,5 @@ Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summa
 其余POST仍为64KiB上限。所有证券代码均为六位字符串加.SH/.SZ/.BJ；不从裸代码猜市场。导入provenance须明确观察时间、元金额、百分数单位和`point_in_time_attested=true`，不等于程序认证外部历史真实性。完整导入细节见`docs/BACKTEST.md`。
 
 `/api/state.research`仅含id/status/generated_at，不把全实验随SSE广播。每日自动核验在15:10后的收盘复盘完成后触发；核验失败单独报告，不抹去已完成的复盘。原始SQLite、竞价日档、实验JSON、Markdown及建议档案在本机data目录隔离保存。优化结果最多说明此数据和预设规则下的比较，不输出交易收益承诺。
+
+当前没有提案验证、批准、拒绝、应用或回退端点；`POST /api/research/proposals`固定只归档`awaiting_future_validation`，`POST /api/config`也不会关联或更新提案。每日滚动研究在留出日期与`holdouts.json`既有日期重叠时降为`exploratory_holdout_reuse`，不能声称新的独立验证。持续优化的人工治理和未来闭环约束见`docs/CONTINUOUS_OPTIMIZATION.md`。

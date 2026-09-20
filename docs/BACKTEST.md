@@ -1,6 +1,6 @@
 # 历史竞价回放、每日核验与因子实验
 
-版本：1.5。项目目录：`E:\A股竞价`。本文面向使用者、后续维护 AI 和外部研究程序。入口为主系统「策略回测」页面；本模块在本机计算，不需要 DeepSeek、OpenAI 或其他模型 Key。
+模块版本：1.5，适用于当前主系统。本文面向使用者、后续维护 AI 和外部研究程序；项目可位于任意可写目录。入口为主系统「策略回测」页面；本模块在本机计算，不需要 DeepSeek、OpenAI 或其他模型 Key。每日执行与外部 AI 的完整操作顺序另见 [持续算法优化手册](CONTINUOUS_OPTIMIZATION.md)。
 
 目标是：**先固定历史日盘前已知的昨日涨停候选，用当时真实收到的竞价序列计算分数，再对照同一天收盘后的完整涨停池，最后按日期划分样本检验参数。** 当天结果只能作标签，不能倒流进候选、背景或竞价因子。
 
@@ -181,12 +181,15 @@ if (-not $auctionExperiment) { throw '尚无已完成实验，请先检查研究
 $auctionDevelopment = Invoke-RestMethod -Uri "$auctionBase/api/research/ai-dataset?id=$auctionExperiment"
 $auctionDevelopment | ConvertTo-Json -Depth 30
 
-# 把真正由开发集研究得到的建议保存为 E:\A股竞价\proposal.json 后，可显式归档：
-# $auctionProposal = Get-Content -LiteralPath 'E:\A股竞价\proposal.json' -Raw -Encoding UTF8
+# 把真正由开发集研究得到的建议保存为当前项目目录的 proposal.json 后，可显式归档：
+# $auctionProposalPath = Join-Path (Get-Location) 'proposal.json'
+# $auctionProposal = Get-Content -LiteralPath $auctionProposalPath -Raw -Encoding UTF8
 # Invoke-RestMethod -Method Post -Uri "$auctionBase/api/research/proposals" -Headers $auctionHeaders -ContentType 'application/json; charset=utf-8' -Body ([Text.Encoding]::UTF8.GetBytes($auctionProposal))
 ```
 
 所有 POST 继续接受本机 Host、同源及 `X-Local-App: auction-lab` 检查。模型应调用专用 API，不读取凭据或扫描其他任务。参数建议文案同样不能填入模型密钥。
+
+当前建议接口只归档 `awaiting_future_validation`，没有验证、批准或应用端点；内置优化器也不会自动读取外部提案。每日自动滚动实验可能重复已暴露留出日期，此时明确标为探索性结果。怎样登记未来新样本和由用户决定应用，见 [持续算法优化手册](CONTINUOUS_OPTIMIZATION.md)，不能把归档成功写成算法已经验证或启用。
 
 ## 留存与复现
 

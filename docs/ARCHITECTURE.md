@@ -1,6 +1,6 @@
 # 架构与二次开发
 
-版本1.7。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。同花顺接入见 `docs/FINANCE_CONNECTION.md`，指定板块取数见 `docs/SECTOR_RESEARCH.md`，历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
+版本1.7。运行与接口以 `app/service.py`、`app/server.py` 为准；公式见策略文档，字段契约见根目录 `CONTRACT.md`。其他 AI 的维护顺序见 `docs/AI_MAINTENANCE.md`，逐端点调用见 `docs/API_REFERENCE.md`，每日数据与参数治理见 `docs/CONTINUOUS_OPTIMIZATION.md`。同花顺接入见 `docs/FINANCE_CONNECTION.md`，指定板块取数见 `docs/SECTOR_RESEARCH.md`，历史回放和每日核验见 `docs/BACKTEST.md`，1.4 官方观察流程见 `docs/OFFICIAL_UPGRADE.md`。
 
 ## 模块与数据流
 
