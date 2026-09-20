@@ -4,13 +4,15 @@
 
 所有新接手的维护 AI 先读 `docs/AI_MAINTENANCE.md`。修改或调用本机接口时再读 `docs/API_REFERENCE.md`；处理每日竞价、收盘标签、权重建议或算法版本时必须读 `docs/CONTINUOUS_OPTIMIZATION.md`。这三份文档负责执行顺序与接口说明，本文件保留当前任务的强制边界；冲突时核对源码、测试和 `CONTRACT.md`，在同一次修改中消除不一致。
 
+仓库随附项目级 `.agents/skills/auction-lab-finance/SKILL.md`。支持 Agent Skills 的维护工具在处理本项目金融接入、竞价采集、收盘核验或相关接口时应使用它；该 Skill 只路由现有项目文档和源码边界，不参与应用运行。
+
 当前外部权重建议只归档为 `awaiting_future_validation`，没有自动未来验证、批准、应用或回退接口。每日滚动实验重复使用已暴露留出日期时只能标探索，不能声称新的独立验证。任何 AI 不得因提案已保存而自动调用 `/api/config`；应用权重须用户明确决定、停止采集、保留旧权重/实验/提案/Git版本并重新准备会话。
 
 ## 同花顺接入维护（1.7）
 
 先读 `docs/FINANCE_CONNECTION.md`。主系统版本1.7，独立AI助手仍1.2。源码应能在任意可写目录运行；上面的E盘约定仅限本任务维护，不能变成开源安装的依赖。
 
-- 用户级 `hithink-finance` Skill 是维护 AI / 开发者可选的官方接口资料与调用辅助，不是竞价研究台的运行依赖。可用时先读其 `SKILL.md`，但项目运行仍由 `app/provider.py` 和本机 `/api/finance/*` 完成取数、配置、验证与调度。安装 Skill 不会提供、保存或验证 API Key，也不得让 Skill 接管实时采集。在本项目中不得按 Skill 的兼容规则把通用 `API_KEY`、`FUYAO_TOKEN` 或 CLI 系统凭据当作已授权金融 Key，不得静默更新 Skill、安装额外 CLI 或初始化本地行情库；这些环境变更须用户明确要求。Skill、源码、测试和官方接口不一致时须核验并在同一次修改中同步文档。
+- 项目级 `auction-lab-finance` Skill 的规则优先用于本仓库；用户级官方 `hithink-finance` Skill 只作为可选的上游接口资料与调用辅助。项目运行仍由 `app/provider.py` 和本机 `/api/finance/*` 完成取数、配置、验证与调度。安装任何 Skill 都不会提供、保存或验证 API Key，也不得让 Skill 接管实时采集。在本项目中不得按通用 Skill 的兼容规则把 `API_KEY`、`FUYAO_TOKEN` 或 CLI 系统凭据当作已授权金融 Key，不得静默更新 Skill、安装额外 CLI 或初始化本地行情库；这些环境变更须用户明确要求。Skill、源码、测试和官方接口不一致时须核验并在同一次修改中同步文档。
 
 - 常驻网页 `#finance` 使用 `/api/finance/config` 只保存、`/api/finance/test` 显式单次日历验证。保存、验证、启动监测语义分离；旧 `/api/credentials` 保留兼容的保存并启动。GET状态不联网，不把configured当认证成功。
 - 用户文件优先于进程变量和Windows用户变量，更新Key必须重置验证和接入缓存。不读回Key/尾号/摘要给网页，不写浏览器存储；测试用临时凭据，禁止改真实凭据。测试官方日历用max_retries=0，HTTP200/code0且非空合法日期才成功。

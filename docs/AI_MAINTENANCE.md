@@ -20,17 +20,19 @@
 
 当文档与源码不一致时，先核实测试和真实运行行为，然后在同一次修改中修正源码、测试和文档。不能只改文档掩盖实现问题，也不能只改实现让契约继续过期。
 
-### 可选的同花顺维护 Skill
+### 项目级与官方同花顺 Skill
 
-维护 AI 或开发者可选择安装官方仓库提供的 `hithink-finance` Skill：
+仓库内置 [项目级 `auction-lab-finance` Skill](../.agents/skills/auction-lab-finance/SKILL.md)。支持 Agent Skills 的 Codex 或其他维护工具进入本仓库后可以直接发现它；该 Skill 负责把金融接入、竞价证据链、持续优化和验证工作路由到本项目已有文档与源码。它随源码分发，但不被 Python 或网页加载，不会增加运行依赖。
+
+需要完整上游接口目录时，维护 AI 或开发者还可选择安装官方仓库提供的全局 `hithink-finance` Skill：
 
 ```powershell
 npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes
 ```
 
-安装后，新会话可先读取该 Skill 的 `SKILL.md`，用它查找官方接口资料、选择 REST / CLI / MCP / Python 路径或辅助诊断。它不授予同花顺账户权限，不包含、保存或验证 API Key，也不是启动竞价研究台所需的组件。项目运行时仍由 `app/provider.py` 调用官方 Financial API，由 `/api/finance/*` 和项目外的用户级凭据完成配置与验证。不要把 Skill 的安装成功写成金融接口认证成功；如果 Skill 说明与本项目源码、测试或当前官方接口不一致，先核验再同步实现与文档。
+安装后，新会话可用官方 Skill 查找接口资料、选择 REST / CLI / MCP / Python 路径或辅助诊断；维护本仓库时仍先遵循项目级 Skill 与 `AGENTS.md`。两种 Skill 都不授予同花顺账户权限，不包含、保存或验证 API Key，也不是启动竞价研究台所需的组件。项目运行时仍由 `app/provider.py` 调用官方 Financial API，由 `/api/finance/*` 和项目外的用户级凭据完成配置与验证。不要把 Skill 的发现或安装成功写成金融接口认证成功；如果 Skill 说明与本项目源码、测试或当前官方接口不一致，先核验再同步实现与文档。
 
-该 Skill 的通用路由还包含兼容读取 `API_KEY` / `FUYAO_TOKEN`、安装 CLI、初始化本地库和低频全局自更新等能力。本项目默认不授权这些行为：维护 AI 只使用其文档资料，不读取通用环境变量或其他工具的密钥库，不静默执行 `skills update`，也不安装额外工具或下载全量数据。用户明确要求更新 Skill 时再执行；需要固定版本的受控环境可设置 `HITHINK_FINANCE_NO_SKILL_UPDATE=1`。这条项目级约定不修改上游 Skill 文件，避免破坏来源追踪和更新校验。
+官方 Skill 的通用路由还包含兼容读取 `API_KEY` / `FUYAO_TOKEN`、安装 CLI、初始化本地库和低频全局自更新等能力。本项目默认不授权这些行为：维护 AI 只使用其文档资料，不读取通用环境变量或其他工具的密钥库，不静默执行 `skills update`，也不安装额外工具或下载全量数据。用户明确要求更新 Skill 时再执行；需要固定版本的受控环境可设置 `HITHINK_FINANCE_NO_SKILL_UPDATE=1`。这条项目级约定不修改上游 Skill 文件，避免破坏来源追踪和更新校验。
 
 ## 2. 不得破坏的系统边界
 

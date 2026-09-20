@@ -1,0 +1,4 @@
+interface:
+  display_name: "竞价研究台·同花顺维护"
+  short_description: "维护金融接口、竞价证据链与持续优化边界"
+  default_prompt: "使用 $auction-lab-finance 检查并维护本项目的同花顺金融接口，保留实时采集、凭据隔离和防未来数据约束。"

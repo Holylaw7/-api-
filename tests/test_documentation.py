@@ -60,6 +60,20 @@ class DocumentationCoverageTests(unittest.TestCase):
         self.assertIn("`API_KEY`", agents)
         self.assertIn("不得静默更新 Skill", agents)
 
+    def test_project_finance_skill_is_discoverable_and_packaged(self):
+        relative = ".agents/skills/auction-lab-finance/SKILL.md"
+        skill_path = ROOT / relative
+        self.assertTrue(skill_path.is_file())
+        skill = skill_path.read_text(encoding="utf-8")
+        self.assertRegex(skill, r"(?m)^name: auction-lab-finance$")
+        self.assertNotIn("[TODO", skill)
+        for target in re.findall(r"\[[^]]+\]\(([^)]+)\)", skill):
+            with self.subTest(target=target):
+                self.assertTrue((skill_path.parent / target).resolve().is_file())
+        release = read("tools/build_release.py")
+        self.assertIn(relative, release)
+        self.assertIn(".agents/skills/auction-lab-finance/agents/openai.yaml", release)
+
 
 if __name__ == "__main__":
     unittest.main()

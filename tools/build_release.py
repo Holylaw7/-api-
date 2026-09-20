@@ -21,7 +21,9 @@ def build():
         archive.writestr('AI助手/README.md', (ROOT / 'AI助手使用说明.md').read_bytes())
     root_files = ['.gitignore', '启动系统.cmd', '启动AI助手.cmd', '验证系统.cmd',
                   'launch.py', 'launch_ai.py', 'run.py', 'run_ai.py', 'start.sh',
-                  'README.md', 'AGENTS.md', 'CONTRACT.md', 'AI助手使用说明.md']
+                  'README.md', 'AGENTS.md', 'CONTRACT.md', 'AI助手使用说明.md',
+                  '.agents/skills/auction-lab-finance/SKILL.md',
+                  '.agents/skills/auction-lab-finance/agents/openai.yaml']
     with ZipFile(ROOT / 'auction-lab.zip', 'w', ZIP_DEFLATED) as archive:
         for relative in root_files:
             add(archive, relative, 'auction-lab')

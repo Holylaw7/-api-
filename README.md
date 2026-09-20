@@ -6,7 +6,7 @@
 
 版本 **1.7**。本机运行的 A 股竞价、个股趋势、涨停与连板研究系统。Python 3.10+，只使用标准库，无需安装第三方依赖。网页新增独立「同花顺接入」：保存自己的 Key、测试官方连接，再开始研究；指定板块取数、历史回放、每日核验、逐批竞价分析和 AI 切换继续使用。
 
-普通用户运行系统不需要 Node.js、`npx` 或 Agent Skill。维护 AI / 开发者可选安装官方仓库的 `hithink-finance` Skill（`npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes`）辅助查阅接口；它不是运行依赖，也不会配置或验证 API Key。程序仍由自身的金融 provider 调用官方 API，Key 仍在网页或用户级凭据中配置。详见 [同花顺接入指南](docs/FINANCE_CONNECTION.md) 与 [AI 修改维护手册](docs/AI_MAINTENANCE.md)。
+普通用户运行系统不需要 Node.js、`npx` 或 Agent Skill。仓库内置项目级 [`auction-lab-finance` Skill](.agents/skills/auction-lab-finance/SKILL.md)，供 Codex 等维护 AI 理解本项目的金融接口、竞价证据链和安全边界；它不是运行依赖，也不会配置或验证 API Key。需要查阅更完整的上游接口资料时，维护者可选安装官方 `hithink-finance` Skill（`npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes`）。程序仍由自身的金融 provider 调用官方 API，Key 仍在网页或用户级凭据中配置。详见 [同花顺接入指南](docs/FINANCE_CONNECTION.md) 与 [AI 修改维护手册](docs/AI_MAINTENANCE.md)。
 
 ## 一键启动
 
@@ -164,6 +164,7 @@ Windows 双击 **`启动系统.cmd`**，浏览器自动打开 <http://127.0.0.1:
 
 ## 文档导航
 
+- [项目级同花顺维护 Skill](.agents/skills/auction-lab-finance/SKILL.md)：让支持 Agent Skills 的维护工具直接发现本项目接口、凭据和实时采集边界。
 - [AI 修改与维护手册](docs/AI_MAINTENANCE.md)：其他 AI 的阅读顺序、不可破坏边界、模块地图、修改矩阵、测试与交接模板。
 - [本机接口与扩展接口说明](docs/API_REFERENCE.md)：主程序、研究接口、独立助手、异步任务和 Python 扩展契约。
 - [每日持续算法优化手册](docs/CONTINUOUS_OPTIMIZATION.md)：竞价到收盘的证据链、开发集出口、建议格式、防过拟合和未来验证边界。
