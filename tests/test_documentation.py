@@ -45,6 +45,21 @@ class DocumentationCoverageTests(unittest.TestCase):
             with self.subTest(required=required):
                 self.assertIn(required, guide)
 
+    def test_optional_finance_skill_is_not_documented_as_runtime_or_credentials(self):
+        for relative in (
+            "README.md", "AGENTS.md", "docs/AI_MAINTENANCE.md", "docs/FINANCE_CONNECTION.md",
+        ):
+            content = read(relative)
+            with self.subTest(relative=relative):
+                self.assertIn("hithink-finance", content)
+                self.assertIn("不是", content)
+        connection = read("docs/FINANCE_CONNECTION.md")
+        self.assertIn("不需要 Node.js", connection)
+        self.assertIn("不会提供、保存或验证 API Key", connection)
+        agents = read("AGENTS.md")
+        self.assertIn("`API_KEY`", agents)
+        self.assertIn("不得静默更新 Skill", agents)
+
 
 if __name__ == "__main__":
     unittest.main()

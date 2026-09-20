@@ -12,6 +12,18 @@
 
 同花顺金融 Key 用于取得行情、日历、涨停池等结构化数据。DeepSeek / OpenAI Key 仅用于文字解释，在「策略与接入」配置。只提供金融 Key 也能使用确定性评分和复盘；不需要购买或配置模型才能取数。
 
+## 可选的维护 Skill
+
+维护 AI 或开发者可以安装官方仓库的 `hithink-finance` Skill，便于查询接口资料和选择接入方式：
+
+```powershell
+npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes
+```
+
+普通用户运行本项目不需要 Node.js、`npx` 或这个 Skill。Skill 不是程序插件，应用运行时不会调用它；真实行情仍由 `app/provider.py` 通过官方 Financial API 读取，并由本网页的 `/api/finance/*` 接口配置和验证。安装 Skill 不会提供、保存或验证 API Key。
+
+名称也要区分：Skill 通常安装在 Agent 的用户级 Skills 目录；下文 `%APPDATA%\hithink-finance` 或其他平台对应目录是本项目保存金融凭据的用户级配置命名空间。两者不是同一个目录，也不能互相替代。
+
 ## 网页上可以看到什么
 
 - 固定的官方接口地址 `https://fuyao.aicubes.cn`、申请入口与使用指南。

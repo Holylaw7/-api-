@@ -10,6 +10,8 @@
 
 先读 `docs/FINANCE_CONNECTION.md`。主系统版本1.7，独立AI助手仍1.2。源码应能在任意可写目录运行；上面的E盘约定仅限本任务维护，不能变成开源安装的依赖。
 
+- 用户级 `hithink-finance` Skill 是维护 AI / 开发者可选的官方接口资料与调用辅助，不是竞价研究台的运行依赖。可用时先读其 `SKILL.md`，但项目运行仍由 `app/provider.py` 和本机 `/api/finance/*` 完成取数、配置、验证与调度。安装 Skill 不会提供、保存或验证 API Key，也不得让 Skill 接管实时采集。在本项目中不得按 Skill 的兼容规则把通用 `API_KEY`、`FUYAO_TOKEN` 或 CLI 系统凭据当作已授权金融 Key，不得静默更新 Skill、安装额外 CLI 或初始化本地行情库；这些环境变更须用户明确要求。Skill、源码、测试和官方接口不一致时须核验并在同一次修改中同步文档。
+
 - 常驻网页 `#finance` 使用 `/api/finance/config` 只保存、`/api/finance/test` 显式单次日历验证。保存、验证、启动监测语义分离；旧 `/api/credentials` 保留兼容的保存并启动。GET状态不联网，不把configured当认证成功。
 - 用户文件优先于进程变量和Windows用户变量，更新Key必须重置验证和接入缓存。不读回Key/尾号/摘要给网页，不写浏览器存储；测试用临时凭据，禁止改真实凭据。测试官方日历用max_retries=0，HTTP200/code0且非空合法日期才成功。
 - 保存需停止监测、任务完成、live且避开09:10–09:26；测试同样避开演示与保护时段。`/api/demo/exit`仅退出合成演示并恢复本机live视图，不联网、不启动，不让无Key用户困在演示中。

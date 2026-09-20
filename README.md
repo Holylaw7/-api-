@@ -6,6 +6,8 @@
 
 版本 **1.7**。本机运行的 A 股竞价、个股趋势、涨停与连板研究系统。Python 3.10+，只使用标准库，无需安装第三方依赖。网页新增独立「同花顺接入」：保存自己的 Key、测试官方连接，再开始研究；指定板块取数、历史回放、每日核验、逐批竞价分析和 AI 切换继续使用。
 
+普通用户运行系统不需要 Node.js、`npx` 或 Agent Skill。维护 AI / 开发者可选安装官方仓库的 `hithink-finance` Skill（`npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes`）辅助查阅接口；它不是运行依赖，也不会配置或验证 API Key。程序仍由自身的金融 provider 调用官方 API，Key 仍在网页或用户级凭据中配置。详见 [同花顺接入指南](docs/FINANCE_CONNECTION.md) 与 [AI 修改维护手册](docs/AI_MAINTENANCE.md)。
+
 ## 一键启动
 
 Windows 双击 **`启动系统.cmd`**，浏览器自动打开 <http://127.0.0.1:8765>。再次双击会复用版本兼容的已运行服务；若仍有旧后台，启动器会提示先重启。新电脑先安装 Python 3.10+；macOS/Linux 可运行 `sh start.sh`。
