@@ -2,6 +2,8 @@
 
 用户指定的唯一开发与运行目录是 `E:\A股竞价`。后续源码、配置、测试、文档和数据修改均在本目录进行。原 Codex 任务下的 `outputs/auction-lab` 仅保留为迁移前备份，不再作为开发或运行目录。执行命令时显式将工作目录设为本目录；用户级凭据仍按既有设计保存在工程外。
 
+Windows 双击入口的 `.cmd` 内容必须保持纯 ASCII 并使用 CRLF；中文提示放在 Python 启动器或网页中。Git 通过 `.gitattributes` 固定 `*.cmd eol=crlf`。不要再次写入 UTF-8 中文批处理并让补丁工具改成仅 LF，否则 `cmd.exe` 的标签跳转会从错误字节位置继续解析。
+
 所有新接手的维护 AI 先读 `docs/AI_MAINTENANCE.md`。修改或调用本机接口时再读 `docs/API_REFERENCE.md`；处理每日竞价、收盘标签、权重建议或算法版本时必须读 `docs/CONTINUOUS_OPTIMIZATION.md`。这三份文档负责执行顺序与接口说明，本文件保留当前任务的强制边界；冲突时核对源码、测试和 `CONTRACT.md`，在同一次修改中消除不一致。
 
 仓库随附项目级 `.agents/skills/auction-lab-finance/SKILL.md`。支持 Agent Skills 的维护工具在处理本项目金融接入、竞价采集、收盘核验或相关接口时应使用它；该 Skill 只路由现有项目文档和源码边界，不参与应用运行。

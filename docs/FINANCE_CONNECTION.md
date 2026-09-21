@@ -81,6 +81,7 @@ npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes
 | 网络失败或超时 | 检查网络与官方站点可达性；不用其他网站代收金融 Key |
 | 保存按钮暂不可用 | 按页面提示停止监测、等候任务完成，或避开09:10–09:26 |
 | 提示服务版本过旧 | 刷新页面不会更新 Python 后台；关闭旧服务或重启电脑，再双击新版目录的启动文件 |
+| 双击后窗口立即关闭或出现 `evel is not recognized` | 使用最新版 `启动系统.cmd`；源码中的批处理应为纯 ASCII + CRLF，中文提示由 Python 或网页显示 |
 | 8765 被其他程序占用 | 使用 `python run.py --port 8768 --no-auto-start`，再打开对应本机端口；不要覆盖其他应用 |
 
 本轮接口、存储、未配置启动及真实连接验收分别记录在 [VALIDATION.md](VALIDATION.md)。维护者先读 [AGENTS.md](../AGENTS.md) 与 [CONTRACT.md](../CONTRACT.md)；连接测试必须保持有界，不进入竞价逐批路径。

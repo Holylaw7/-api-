@@ -19,7 +19,7 @@ def build():
         for relative in shared:
             add(archive, relative, 'AI助手')
         archive.writestr('AI助手/README.md', (ROOT / 'AI助手使用说明.md').read_bytes())
-    root_files = ['.gitignore', '启动系统.cmd', '启动AI助手.cmd', '验证系统.cmd',
+    root_files = ['.gitignore', '.gitattributes', '启动系统.cmd', '启动AI助手.cmd', '验证系统.cmd',
                   'launch.py', 'launch_ai.py', 'run.py', 'run_ai.py', 'start.sh',
                   'README.md', 'AGENTS.md', 'CONTRACT.md', 'AI助手使用说明.md',
                   '.agents/skills/auction-lab-finance/SKILL.md',
