@@ -56,9 +56,9 @@ def fixture():
 
 
 class SectorSummaryTests(unittest.TestCase):
-    def test_targeted_board_survives_general_top30_and_preserves_date_and_missing(self):
+    def test_targeted_board_survives_general_top_list_and_preserves_date_and_missing(self):
         result = build_summary(fixture())
-        self.assertEqual(len(result['sectors_top30']['rows']), 30)
+        self.assertEqual(len(result['sectors_top30']['rows']), 60)
         self.assertNotIn('886001.TI', str(result['sectors_top30']))
         evidence = result['targeted_sectors']
         board = evidence['boards'][0]
@@ -95,15 +95,18 @@ class SectorSummaryTests(unittest.TestCase):
     def test_each_list_cap_keeps_complete_counts_and_explicit_truncation(self):
         state = fixture()
         state['sector_research']['boards'] *= 4
+        for board in state['sector_research']['boards']:
+            board['members'] = board['members'] * 2          # 90 rows > the 60-row export cap
+            board['limit_up_members'] = board['limit_up_members'] * 3   # 105 rows > the cap
         result = build_summary(state)['targeted_sectors']
         self.assertEqual(result['available_board_count'], 4)
         self.assertEqual(result['shown_board_count'], 3)
         self.assertIs(result['boards_truncated'], True)
         for board in result['boards']:
-            self.assertEqual(len(board['members']), 30)
-            self.assertEqual(len(board['limit_up_members']), 30)
-            self.assertEqual(board['coverage']['shown_count'], 30)
-            self.assertEqual(board['coverage']['limit_up_shown_count'], 30)
+            self.assertLessEqual(len(board['members']), 60)
+            self.assertLessEqual(len(board['limit_up_members']), 60)
+            self.assertEqual(board['coverage']['shown_count'], len(board['members']))
+            self.assertEqual(board['coverage']['limit_up_shown_count'], len(board['limit_up_members']))
             self.assertIs(board['coverage']['truncated'], True)
             self.assertIs(board['coverage']['limit_up_truncated'], True)
             self.assertEqual(board['member_count'], 80)
@@ -112,6 +115,21 @@ class SectorSummaryTests(unittest.TestCase):
             self.assertEqual(board['statistics']['consecutive_known_count'], 30)
             self.assertEqual(board['statistics']['total_members'], 80)
             self.assertEqual(board['statistics']['quoted_count'], 45)
+
+    def test_bounded_lists_use_the_sixty_row_cap_before_any_recap(self):
+        state = fixture()
+        board = state['sector_research']['boards'][0]
+        board['members'] = board['members'] * 2          # 90 rows > the 60-row export cap
+        board['limit_up_members'] = board['limit_up_members'] * 3   # 105 rows > the cap
+        summary = build_summary(state)
+        self.assertLessEqual(len(json.dumps(summary, ensure_ascii=False)), 100_000)
+        exported = summary['targeted_sectors']['boards'][0]
+        self.assertEqual(len(exported['members']), 60)
+        self.assertEqual(len(exported['limit_up_members']), 60)
+        self.assertEqual(exported['coverage']['shown_count'], 60)
+        self.assertEqual(exported['coverage']['limit_up_shown_count'], 60)
+        self.assertIn('最多60项', summary['scope_note'])
+        self.assertNotIn('进一步限制', summary['scope_note'])
 
     def test_preexisting_upstream_truncation_is_not_cleared_by_short_sample(self):
         state = fixture()

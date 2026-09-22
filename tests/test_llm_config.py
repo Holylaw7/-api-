@@ -40,7 +40,7 @@ class ConfigTests(unittest.TestCase):
                 self_test.assertNotIn('never-send',str(parsed))
                 self_test.assertEqual(req.get_header('Authorization'),'Bearer model-only')
                 content=parsed['messages'][1]['content'].split('\n数据：',1)[1]
-                self_test.assertEqual(len(json.loads(content)['sectors_top30']['rows']),30)
+                self_test.assertEqual(len(json.loads(content)['sectors_top30']['rows']),60)
                 return Response()
         self_test=self
         with patch('app.ai_gateway.build_opener',return_value=Opener()):
@@ -63,12 +63,45 @@ class ConfigTests(unittest.TestCase):
         self.assertNotIn('private-marker',serial)
         self.assertNotIn('full-history-private',serial)
         self.assertEqual(summary['mode'],'demo')
-        self.assertEqual(len(summary['auction_top30']),30)
+        self.assertEqual(len(summary['auction_top30']),50)
         self.assertIsNone(summary['auction_top30'][0]['score'])
         self.assertEqual(summary['auction_top30'][0]['factors']['gap']['score'],60)
         self.assertEqual(summary['selected_stock']['date'],'2026-09-17')
         self.assertEqual(summary['selected_stock']['auction']['date'],'2026-09-18')
         self.assertIs(summary['review']['market']['date_verified'],False)
+
+    def test_summary_states_bounded_scope_instead_of_claiming_completeness(self):
+        limit_up_rows=[{'thscode':f'600{index:03d}.SH','name':'样本'} for index in range(103)]
+        sector_rows=[{'thscode':f'88{index:04d}.TI','name':'板块'} for index in range(710)]
+        state={'mode':'live','now':'2026-09-21T23:00:00+08:00',
+               'review':{'date':'2026-09-21','status':'partial',
+                         'limit_up':{'count':103,'rows':limit_up_rows},
+                         'sectors':{'rows':sector_rows,'coverage':{'ranked_count':710}},
+                         'sentiment':{'reasons':{'group_count':30,'displayed_count':30,
+                                                 'rows':[{'reason':f'原因{index:02}','codes':[]} for index in range(30)]}}}}
+        summary=build_summary(state)
+        self.assertEqual(len(summary['limit_up_top30']['rows']),60)
+        self.assertEqual(summary['limit_up_scope'],{'shown':60,'available':103,'total':103,'limit':60,'truncated':True})
+        self.assertEqual(len(summary['sectors_top30']['rows']),60)
+        self.assertEqual(summary['sectors_scope'],{'shown':60,'available':710,'total':710,'limit':60,'truncated':True})
+        self.assertEqual(len(summary['sentiment']['reasons']['rows']),30)
+        self.assertIn('不是全市场或板块完整成员数量',summary['scope_note'])
+        self.assertIn('最多60项',summary['scope_note'])
+
+    def test_oversized_summary_is_recapped_and_still_discloses_totals(self):
+        filler='x'*1200
+        rows=[{'thscode':f'600{index:03d}.SH','name':filler,'limit_up_reason':filler} for index in range(60)]
+        sectors=[{'thscode':f'88{index:04d}.TI','name':filler} for index in range(60)]
+        state={'mode':'live','review':{'date':'2026-09-21','status':'partial',
+               'limit_up':{'count':103,'rows':rows},
+               'sectors':{'rows':sectors,'coverage':{'ranked_count':710}},
+               'sentiment':{'reasons':{'group_count':30,'displayed_count':30,
+                                       'rows':[{'reason':filler,'codes':[]} for index in range(30)]}}}}
+        summary=build_summary(state)
+        self.assertLessEqual(len(json.dumps(summary,ensure_ascii=False)),150000)
+        self.assertLessEqual(len(summary['limit_up_top30']['rows']),30)
+        self.assertTrue('进一步限制' in summary['scope_note'] or '只保留' in summary['scope_note'])
+        self.assertTrue(summary['limit_up_scope']['truncated'])
 
     def test_summary_accepts_cached_review_without_live_sections(self):
         result=build_summary({'mode':'cached','review':{'date':'2026-09-18','status':'partial'}})

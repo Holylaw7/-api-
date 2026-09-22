@@ -192,13 +192,22 @@ class SentimentTests(unittest.TestCase):
         result = build_sentiment(report(rows))["reasons"]
         self.assertEqual(result["known_count"], 29)
         self.assertEqual(result["group_count"], 16)
-        self.assertEqual(result["displayed_count"], 12)
+        self.assertEqual(result["displayed_count"], 16)
         self.assertEqual(result["rows"][0]["reason"], "AI+光伏；官方完整说明")
         self.assertEqual(result["rows"][0]["count"], 14)
         self.assertEqual(len(result["rows"][0]["codes"]), 10)
         self.assertEqual(result["rows"][0]["other_code_count"], 4)
         reversed_result = build_sentiment(report(list(reversed(rows))))["reasons"]
         self.assertEqual(result, reversed_result)
+
+    def test_reason_groups_are_capped_at_thirty_with_an_explicit_notice(self):
+        rows = [stock(f"600{index:03}.SH", limit_up_reason=f"原因{index:02}") for index in range(35)]
+        result = build_sentiment(report(rows))["reasons"]
+        self.assertEqual(result["group_count"], 35)
+        self.assertEqual(result["displayed_count"], 30)
+        self.assertEqual(len(result["rows"]), 30)
+        self.assertTrue(any("展示前30组，另有5组未展开" in warning for warning in result["warnings"]))
+        self.assertIn("展示前30组", result["definition"])
 
     def test_reason_missing_does_not_fall_back_to_tag_or_name(self):
         rows = [stock(limit_up_reason=None, tag="半导体", reason="行业", name="AI概念")]

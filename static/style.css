@@ -39,3 +39,15 @@
 @media(max-width:1100px){.backtest-steps{grid-template-columns:repeat(2,minmax(0,1fr))}.backtest-availability{grid-template-columns:repeat(2,minmax(0,1fr))}.backtest-session-controls>.search-box{margin-left:0}.backtest-session-controls select{flex:1;min-width:230px}.backtest-actions>span{flex-basis:100%}}
 @media(max-width:760px){.backtest-steps>div{padding:14px}.backtest-steps small{font-size:9px}.backtest-availability{grid-template-columns:1fr}.backtest-actions{padding:15px 16px;gap:8px}.backtest-partitions{padding:16px;grid-template-columns:1fr;gap:13px}.backtest-partitions strong{font-size:11px}.backtest-session-controls{padding:0 16px 14px;gap:9px}.backtest-session-controls>label:first-child{flex-basis:100%}.backtest-session-controls select{max-width:none;min-width:0;width:100%;flex-basis:100%}.backtest-session-controls>.search-box{max-width:none;width:100%}.backtest-import>summary{padding:17px 16px;align-items:flex-start}.backtest-import>summary>span:first-child{gap:7px}.backtest-import>summary small{padding-left:17px;line-height:1.8}.backtest-import>summary>.pill{white-space:nowrap;font-size:9px}.backtest-factor-section>summary{padding:16px}.backtest-panel>.panel-heading{flex-wrap:wrap}}
 @media(max-width:420px){.backtest-steps{grid-template-columns:1fr}.backtest-steps>div{padding:13px 16px}.backtest-steps small{font-size:10px}.backtest-import>summary{flex-wrap:wrap}.backtest-actions>.button{font-size:10px}}
+.observation-window-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:10px;font-size:9px;color:#5f7798}
+.observation-window-head .text-button{padding:2px 4px;white-space:nowrap}
+.observation-window-head .text-button.paused{color:#9aa9c0}
+.observation-window{max-height:188px;overflow-y:auto;margin-top:8px;border-top:1px solid #202e40;border-bottom:1px solid #202e40;overscroll-behavior:contain;font-variant-numeric:tabular-nums}
+.observation-row{display:grid;grid-template-columns:62px 54px 1fr 38px;gap:8px;align-items:center;font-size:9px;padding:5px 2px;color:#758ba9;border-top:1px solid #1b2637}
+.observation-row:first-child{border-top:0}
+.observation-row.latest{background:#1a2433}
+.observation-row .obs-amount{text-align:right;color:#9fb0c9}
+.observation-row .obs-stage{text-align:right;color:#5f7798}
+.observation-row .obs-stage.stage-final{color:var(--gold)}
+.observation-window-note{font-size:9px;color:#63798f;line-height:1.8;margin:7px 0 0}
+.research-grid>.detail-panel{position:sticky;top:18px;max-height:calc(100vh - 36px);overflow-y:auto}

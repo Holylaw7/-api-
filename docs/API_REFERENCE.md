@@ -92,9 +92,11 @@ GET 不会为了补齐证据访问金融接口。实际取数由下方 POST 明�
 | GET `/api/research/ai-dataset?id=<24hex>` | `id` 可省略取最近 | 专供调参模型的 `development_only` 数据；隐藏保留期明细 | 只读本机 |
 | GET `/api/research/history?date=YYYY-MM-DD` | 指定真实本机日期 | 盘前清单、全日批次白名单和已知结果池；用于审计/迁移，不应用于反复选参 | 只读本机；保护时段拒绝 |
 | GET `/api/research/proposals` | 无 | `{items,limit:100,automatic_application:false}` | 只读本机 |
-| GET `/api/research/daily` | 无 | `{items}`，最多 365 个每日冻结/核验摘要 | 只读本机 |
-| GET `/api/research/daily?date=YYYY-MM-DD` | 日期 | 最近核验版本；没有则返回竞价冻结版或 `unavailable` | 只读本机 |
-| GET `/api/research/daily/export?date=...&format=markdown|json` | 日期、格式 | 每日不可变档案下载 | 只读本机 |
+| GET `/api/research/daily` | 无 | `{items}`，最多 365 个每日冻结/校正/核验摘要 | 只读本机 |
+| GET `/api/research/daily?date=YYYY-MM-DD` | 日期 | 最近核验版本；没有则校正版本，再否则竞价冻结版或 `unavailable` | 只读本机 |
+| GET `/api/research/daily/export?date=...&format=markdown|json` | 日期、格式 | 所选版本的每日不可变档案下载；`markdown` 是同一对象的排名汇总 | 只读本机 |
+
+每日 `markdown` 不需要先手动保存：09:25 后约一分钟先写实时排名视图 `data/research/daily/YYYY-MM-DD-morning-ranking.md`（09:26 分钟内按新批次刷新，声明为非不可变证据），09:27 冻结时自动写出 `YYYY-MM-DD-auction.md`，15:10 后的核验版本另写 `YYYY-MM-DD-<24位ID>.md`；冻结件与核验件只写一次且不改写冻结分数。整日因归一化或实现缺陷不可评分时，维护者用 `python tools/rebuild_daily_ranking.py --date YYYY-MM-DD --reason "..."` 生成独立校正版本（只读本机 SQLite，不联网），再由 15:10 核验把标签加到重建分数上。
 
 `/api/research/ai-dataset` 的稳定顶层结构：
 
@@ -189,7 +191,7 @@ warnings
 | --- | --- | --- |
 | POST `/api/reports/load` | `{"date":"YYYY-MM-DD"}` | 读取本机历史视图，不请求行情，不改变最新自动报告 |
 | POST `/api/reports/save` | `{date?,include_ai?,provider?,review_id?,baseline?}` | 保存 Markdown，返回 `filename,mode,review_id,sha256,download_url` |
-| POST `/api/reports/enrich` | `{"date":"...","review_id":"64hex"}` | 后台补充风向标与三类龙虎榜；生成新报告版本 |
+| POST `/api/reports/enrich` | `{"date":"...","review_id":"64hex"}` | 后台重试/刷新风向标与三类龙虎榜（生成复盘时已自动读取一次）；生成新报告版本 |
 | POST `/api/sectors/search` | `{"query":"PCB"}` | 查询官方行业/概念目录；缓存未命中时会联网 |
 | POST `/api/sectors/research` | `{"codes":["885959.TI"],"date":"...","review_id":"64hex"}` | 后台有界取数并独立保存证据，不调用模型 |
 
@@ -295,7 +297,7 @@ warnings
 | 路径 | 内容 | 可否直接给调参 AI |
 | --- | --- | --- |
 | `data/market.sqlite3` | live/demo 批次、报告、盘前清单、时点决策 | 否；优先走白名单接口 |
-| `data/research/daily/` | 每日竞价冻结与收盘核验 | 只作审计；可能含后来标签 |
+| `data/research/daily/` | 每日竞价冻结、排名 Markdown（含 09:26 实时视图）、校正版本与收盘核验 | 只作审计；实时视图非证据，可能含后来标签 |
 | `data/research/experiments/` | 完整实验 JSON/Markdown | 否；含保留期结果 |
 | `data/research/holdouts.json` | 已暴露保留日期台账 | 只读治理证据，不删除 |
 | `data/research/proposals/` | 外部 AI 待验证建议 | 可用于追溯，不能视为已通过 |

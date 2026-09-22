@@ -28,6 +28,7 @@
   const state = {snapshot: null, selected: null, filter: 'all', search: '', page: 'auction', history: [], historyKey: '', historyLastFetch: 0, historyBusy: false, connected: false, configLoaded: false, reportSignature: '', reviewDateTouched: false, watchlistSettingsDirty: false, queryRequested: '', llmProvider: '', llmDirty: false, llmSignature: '', llmSwitching: false, reports: [], reportsBusy: false, reportsMode: '', reportsGeneration: 0, reportSaveBusy: false, reportLoadBusy: false, comparisonBusy: false, comparisonGeneration: 0, diagnosticsBusy: false, diagnosticsLoaded: false};
   Object.assign(state, {sectorSelection: [], sectorMatches: [], sectorSearchBusy: false, sectorFetchBusy: false, sectorCacheBusy: false, sectorEvidence: null, sectorSyncKey: '', sectorPreviewSignature: '', sectorSearchMessage: '', sectorError: ''});
   Object.assign(state, {finance: null, financeBusy: false, financeLoading: false, financeError: ''});
+  Object.assign(state, {observationFollow: true, observationScrolling: false, observationSymbol: '', observationScrollTop: 0, observationPending: 0, observationPausedTotal: null});
   let pollTimer = null;
   let polling = false;
   const factors = {
@@ -423,6 +424,78 @@
     return `<svg class="sparkline" viewBox="0 0 250 72" role="img" aria-label="竞价涨幅观测轨迹，范围 ${esc(num(low, 2))}% 到 ${esc(num(high, 2))}%"><line x1="0" y1="60" x2="250" y2="60" stroke="#2d3c51" stroke-dasharray="3 4"/><polygon points="3,65 ${poly} 247,65" fill="#d8b57410"/><polyline points="${poly}" fill="none" stroke="#d8b574" stroke-width="1.8" stroke-linejoin="round"/><circle cx="247" cy="${coords[coords.length - 1].split(',')[1]}" r="3" fill="#d8b574"/></svg><div class="chart-labels"><span>${esc(time(points[0].received_at || points[0].updated_at))}</span><span>${esc(num(low, 2))} ~ ${esc(num(high, 2))}%</span><span>${esc(time(points[points.length - 1].received_at || points[points.length - 1].updated_at))}</span></div>`;
   }
 
+  const OBSERVATION_WINDOW = 60;
+
+  function observationWindow(items) {
+    const shown = items.slice(-OBSERVATION_WINDOW);
+    const rows = shown.map((item, index) => {
+      const stage = item.stage === 'final' ? 'final' : 'live';
+      const latest = index === shown.length - 1 ? ' latest' : '';
+      return `<div class="observation-row${latest}"><span>${esc(time(item.received_at || item.updated_at))}</span><span class="${tone(item.auction_pct)}">${esc(percent(item.auction_pct))}</span><span class="obs-amount">${esc(amount(item.auction_amount))}</span><span class="obs-stage ${stage === 'final' ? 'stage-final' : ''}">${stage === 'final' ? '终态' : '实时'}</span></div>`;
+    }).join('');
+    const note = items.length > shown.length ? `共 ${items.length} 次 · 显示最近 ${shown.length} 次` : `共 ${shown.length} 次观测`;
+    return `<div class="observation-window-head"><span class="subtle">按本地接收顺序 · ${note}</span><button type="button" class="text-button" id="observation-follow" data-observation-follow aria-pressed="true">跟随最新 ●</button></div><div class="observation-window" id="observation-window" role="log" aria-live="off" data-total="${items.length}" tabindex="0" aria-label="个股竞价观测流水，默认跟随最新记录">${rows || '<p class="subtle">尚未取得本机观测记录。</p>'}</div><p class="observation-window-note">新批次到达时自动滑到最新；滑轮滚动不会打断跟随；需要停留查看历史时点「跟随最新」暂停，暂停期间按钮会显示未跟随的新观测条数。时间为本地接收时间，不是交易所行情时间。</p>`;
+  }
+
+  function updateObservationFollowButton() {
+    const button = $('observation-follow');
+    if (!button) return;
+    const pending = Math.max(0, Number(state.observationPending || 0));
+    button.textContent = state.observationFollow ? '跟随最新 ●'
+      : pending > 0 ? `${pending} 条新观测 · 回到最新` : '已暂停 · 点此跟随';
+    button.setAttribute('aria-pressed', state.observationFollow ? 'true' : 'false');
+    button.classList.toggle('paused', !state.observationFollow);
+  }
+
+  function observationTotal() {
+    const box = $('observation-window');
+    const total = box ? Number(box.dataset.total) : NaN;
+    return Number.isFinite(total) ? total : null;
+  }
+
+  function setObservationFollow(following, scroll = true) {
+    state.observationFollow = following;
+    state.observationPausedTotal = observationTotal();
+    state.observationPending = 0;
+    updateObservationFollowButton();
+    const box = $('observation-window');
+    if (!box || !following) return;
+    state.observationScrollTop = box.scrollHeight;
+    if (!scroll) return;
+    state.observationScrolling = true;
+    try { box.scrollTo({top: box.scrollHeight, behavior: 'smooth'}); } catch (error) { box.scrollTop = box.scrollHeight; }
+    window.setTimeout(() => { state.observationScrolling = false; }, 450);
+  }
+
+  function mountObservationWindow() {
+    const box = $('observation-window');
+    if (!box) return;
+    const total = Number(box.dataset.total || 0);
+    if (state.observationSymbol !== state.selected) {
+      state.observationSymbol = state.selected;
+      state.observationScrollTop = 0;
+      state.observationFollow = true;
+      state.observationPausedTotal = total;
+      state.observationPending = 0;
+    }
+    if (state.observationFollow) {
+      // 跟随开启时，每次重绘都滑到最新一条；滑轮滚动不会关闭跟随。
+      state.observationScrolling = true;
+      box.scrollTop = box.scrollHeight;
+      try { box.scrollTo({top: box.scrollHeight, behavior: 'smooth'}); } catch (error) { /* 旧内核已直接置底 */ }
+      state.observationScrollTop = box.scrollHeight;
+      window.setTimeout(() => { state.observationScrolling = false; }, 450);
+    } else {
+      state.observationPending = Number.isFinite(state.observationPausedTotal)
+        ? Math.max(0, total - state.observationPausedTotal) : 0;
+      box.scrollTop = Math.max(0, Math.min(state.observationScrollTop, box.scrollHeight - box.clientHeight));
+    }
+    updateObservationFollowButton();
+    box.addEventListener('scroll', () => {
+      state.observationScrollTop = box.scrollHeight - box.scrollTop - box.clientHeight <= 2 ? box.scrollHeight : box.scrollTop;
+    }, {passive: true});
+  }
+
   function renderDetail() {
     const row = list(state.snapshot?.auction?.rows).find((item) => item.thscode === state.selected);
     if (!row) {
@@ -443,7 +516,8 @@
     const qualityNotes = [...q.flags];
     if (numeric(row.quality?.window_coverage)) qualityNotes.push(`十分钟窗口观测覆盖 ${ratio(row.quality.window_coverage)}，首次接收 ${time(row.quality.first_observed_at)}。`);
     if (row.quality?.upstream_freshness === 'unknown' && !qualityNotes.some((note) => String(note).includes('上游实时延迟未知'))) qualityNotes.push('上游未提供可靠行情时间，页面时间为本地接收时间。');
-    $('stock-detail').innerHTML = `<div class="detail-top"><div><strong class="detail-stock-name">${esc(row.name || row.thscode)}</strong><span class="detail-stock-code">${esc(row.thscode)}</span></div><div class="detail-score">${esc(num(row.score, 1))}<small>竞价综合评分 / 100</small></div></div><div class="detail-facts"><div><span>竞价涨幅</span><strong class="${tone(row.auction_pct)}">${esc(percent(row.auction_pct))}</strong></div><div><span>竞价金额</span><strong>${esc(amount(row.auction_amount))}</strong></div><div><span>有效观测次数</span><strong>${esc(num(row.quality?.observation_count ?? normalizedItems.length, 0))}</strong></div><div><span>因子覆盖</span><strong>${esc(ratio(row.quality?.factor_coverage))}</strong></div></div><div class="detail-section"><h3>因子拆解<span>悬停查看权重贡献</span></h3>${factorHTML || '<p class="subtle">暂无有效因子。</p>'}</div><div class="detail-section"><h3>竞价涨幅轨迹<span>接收顺序</span></h3>${sparkline(normalizedItems)}<div class="history-list">${normalizedItems.slice(-5).reverse().map((item) => `<div class="history-item"><span>${esc(time(item.received_at || item.updated_at))}</span><span class="${tone(item.auction_pct)}">${esc(percent(item.auction_pct))}</span><span>${esc(amount(item.auction_amount))}</span></div>`).join('')}</div></div><div class="detail-section"><h3>数据口径<span class="quality-pill ${q.className}">${esc(q.label)}</span></h3><div class="quality-note">${qualityNotes.length ? qualityNotes.map(esc).join('<br>') : '有效字段已参与计算；评分只反映采集范围内的竞价表现。'}<br>最近接收：${esc(time(row.updated_at))}</div></div>`;
+    $('stock-detail').innerHTML = `<div class="detail-top"><div><strong class="detail-stock-name">${esc(row.name || row.thscode)}</strong><span class="detail-stock-code">${esc(row.thscode)}</span></div><div class="detail-score">${esc(num(row.score, 1))}<small>竞价综合评分 / 100</small></div></div><div class="detail-facts"><div><span>竞价涨幅</span><strong class="${tone(row.auction_pct)}">${esc(percent(row.auction_pct))}</strong></div><div><span>竞价金额</span><strong>${esc(amount(row.auction_amount))}</strong></div><div><span>有效观测次数</span><strong>${esc(num(row.quality?.observation_count ?? normalizedItems.length, 0))}</strong></div><div><span>因子覆盖</span><strong>${esc(ratio(row.quality?.factor_coverage))}</strong></div></div><div class="detail-section"><h3>因子拆解<span>悬停查看权重贡献</span></h3>${factorHTML || '<p class="subtle">暂无有效因子。</p>'}</div><div class="detail-section"><h3>竞价涨幅轨迹<span>接收顺序</span></h3>${sparkline(normalizedItems)}${observationWindow(normalizedItems)}</div><div class="detail-section"><h3>数据口径<span class="quality-pill ${q.className}">${esc(q.label)}</span></h3><div class="quality-note">${qualityNotes.length ? qualityNotes.map(esc).join('<br>') : '有效字段已参与计算；评分只反映采集范围内的竞价表现。'}<br>最近接收：${esc(time(row.updated_at))}</div></div>`;
+    mountObservationWindow();
   }
 
   function factorBars(entries, labels = {}) {
@@ -1124,7 +1198,7 @@
       return `<td class="heat-cell" style="--cell-strength:${numeric(value) ? .035 + Number(value) / maxCell * .22 : 0}"><strong>${esc(num(value, 0))}</strong>${numeric(lower) && Number(lower) > 0 ? `<small>下限 ${esc(num(lower, 0))}</small>` : ''}</td>`;
     }).join('')}<td>${esc(num(row.lower_bound_count, 0))}</td><td><span class="${row.coverage?.complete ? 'neutral' : 'research-warn'}">${row.coverage?.complete ? '完整' : '不完整'}</span><small class="sector-source">观察 ${esc(num(row.coverage?.observed_count, 0))} 只</small></td></tr>`).join('') : '<tr><td colspan="10" class="table-empty">尚无可核验的逐日完整涨停池，缺失不记作零。</td></tr>';
     text('sentiment-reason-coverage', `有原因 ${num(reasons.known_count, 0)} / 全池 ${num(reasons.total_count, 0)} · 共 ${num(reasons.group_count, 0)} 组 · 覆盖 ${pctValue(reasons.coverage_pct)}`);
-    $('sentiment-reasons-body').innerHTML = list(reasons.rows).length ? list(reasons.rows).slice(0, 12).map((row) => `<tr><td class="research-reason">${esc(row.reason)}</td><td>${esc(num(row.count, 0))}</td><td>${esc(pctValue(row.share_pct))}</td><td><div class="research-codes">${list(row.codes).slice(0, 10).map((code) => datedStockButton(code, date)).join('')}</div>${numeric(row.other_code_count) && row.other_code_count > 0 ? `<small class="sector-source">另 ${esc(num(row.other_code_count, 0))} 只未展开</small>` : ''}</td></tr>`).join('') : '<tr><td colspan="4" class="table-empty">暂无可用官方涨停原因；不由名称或其他标签推测。</td></tr>';
+    $('sentiment-reasons-body').innerHTML = list(reasons.rows).length ? list(reasons.rows).slice(0, 30).map((row) => `<tr><td class="research-reason">${esc(row.reason)}</td><td>${esc(num(row.count, 0))}</td><td>${esc(pctValue(row.share_pct))}</td><td><div class="research-codes">${list(row.codes).slice(0, 10).map((code) => datedStockButton(code, date)).join('')}</div>${numeric(row.other_code_count) && row.other_code_count > 0 ? `<small class="sector-source">另 ${esc(num(row.other_code_count, 0))} 只未展开</small>` : ''}</td></tr>`).join('') : '<tr><td colspan="4" class="table-empty">暂无可用官方涨停原因；不由名称或其他标签推测。</td></tr>';
     $('sentiment-warnings').innerHTML = researchWarnings([...list(sentiment?.warnings), ...days.flatMap((row) => list(row.warnings).map((warning) => `${row.date}：${warning}`)), ...(retention.definition ? [retention.definition] : [])]);
     renderOfficialContext(official, report);
   }
@@ -1598,6 +1672,8 @@
     const stockAction = event.target.closest('[data-stock-action]');
     if (stockAction?.dataset.stockAction === 'add-current') { await addWatchlist($('stock-code').value || state.snapshot?.stocks?.analysis?.thscode, stockAction); return; }
     if (stockAction?.dataset.stockAction === 'refresh-trends') { await mutate('/api/trends/refresh', {}, '趋势池刷新已提交', stockAction); return; }
+    const follow = event.target.closest('[data-observation-follow]');
+    if (follow) { setObservationFollow(!state.observationFollow); return; }
     const filter = event.target.closest('[data-filter]');
     if (filter) {
       state.filter = filter.dataset.filter;

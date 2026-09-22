@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
 
+from app import engine as engine_module
 from app.daily_validation import DailyValidation
 from app.engine import AuctionEngine, DEFAULT_WEIGHTS, SHANGHAI
 from app.replay import replay_session
@@ -62,6 +63,39 @@ class DailyValidationTests(unittest.TestCase):
         for clock, pct in (("09:16:00", 1), ("09:24:00", 1), ("09:24:20", 2), ("09:24:40", 3)):
             self.batch(clock, pct, weights)
         self.batch("09:25:05", 4, weights, final=True)
+
+    def seed_observed_upstream_names(self):
+        """Batches exactly as the 2026-09-21 authenticated session returned them."""
+        self.store.freeze_manifest(manifest())
+        weights = dict(DEFAULT_WEIGHTS)
+        for clock, phase, pct in (("09:16:00", "order_entry", 1), ("09:24:00", "no_cancel", 2),
+                                  ("09:24:40", "no_cancel", 3)):
+            stamp = at(clock)
+            self.store.batch(DAY, "live", stamp.isoformat(), "live", {
+                "timestamp": int(stamp.timestamp() * 1000), "auction_phase": phase, "data_status": "live",
+                "item": [{"thscode": CODE, "name": "样本股", "auction_pct": pct, "auction_amount": 20_000_000,
+                          "auction_turnover_pct": .3, "auction_volume_ratio": 3}],
+                "_strategy_weights": weights})
+        stamp = at("09:25:05")
+        self.store.batch(DAY, "live", stamp.isoformat(), "final", {
+            "timestamp": int(stamp.timestamp() * 1000), "auction_phase": "matched", "data_status": "final",
+            "item": [{"thscode": CODE, "name": "样本股", "auction_pct": 4, "auction_amount": 20_000_000,
+                      "auction_turnover_pct": .3, "auction_volume_ratio": 3}],
+            "_strategy_weights": weights})
+
+    @staticmethod
+    def freeze_as_pre_fix_engine(daily, clock="09:27:00"):
+        """Freeze while upstream names are still outside the allowlist."""
+        current = engine_module.normalize_auction_metadata
+
+        def older(data, received_at):
+            metadata = current(data, received_at)
+            if data.get("auction_phase") in ("order_entry", "no_cancel", "matched"):
+                metadata.update(data_status="not_ready", auction_phase="unknown")
+            return metadata
+
+        with patch("app.engine.normalize_auction_metadata", side_effect=older):
+            return daily.freeze(DAY, at(clock))
 
     def decision(self, checkpoint="09:24:50", weights=None):
         current = AuctionEngine(weights or DEFAULT_WEIGHTS)
@@ -270,6 +304,178 @@ class DailyValidationTests(unittest.TestCase):
             self.daily.export(DAY, format="html")
         with self.assertRaises(ValueError):
             self.daily.get("../config")
+
+    def test_field_coverage_report_tool_summarizes_saved_batches(self):
+        import contextlib
+        import io
+
+        from tools import field_coverage_report
+
+        self.store.freeze_manifest(manifest())
+        weights = dict(DEFAULT_WEIGHTS)
+        for clock, with_ratio in (("09:16:00", True), ("09:24:40", False)):
+            stamp = at(clock)
+            item = {"thscode": CODE, "name": "样本股", "auction_pct": 2, "auction_amount": 20_000_000,
+                    "auction_turnover_pct": .3}
+            if with_ratio:
+                item["auction_volume_ratio"] = 3
+            self.store.batch(DAY, "live", stamp.isoformat(), "live",
+                             {"timestamp": int(stamp.timestamp() * 1000), "auction_phase": "live",
+                              "data_status": "live", "item": [item], "_strategy_weights": weights})
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = field_coverage_report.main(["--date", DAY, "--database", str(self.root / "market.sqlite")])
+        text = buffer.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn(f"| {DAY} | 1（manifest_context） | 2 | 0/1 | 0/1 | 1/1 |", text)
+        self.assertIn("否（缺 auction_volume_ratio）", text)
+        self.assertIn("只读 batches + 盘前清单", text)
+
+    def test_frozen_archive_audits_raw_field_availability(self):
+        self.store.freeze_manifest(manifest())
+        weights = dict(DEFAULT_WEIGHTS)
+        for clock, with_ratio in (("09:16:00", True), ("09:24:00", False), ("09:24:40", False)):
+            stamp = at(clock)
+            item = {"thscode": CODE, "name": "样本股", "auction_pct": 2, "auction_amount": 20_000_000,
+                    "auction_turnover_pct": .3}
+            if with_ratio:
+                item["auction_volume_ratio"] = 3
+            self.store.batch(DAY, "live", stamp.isoformat(), "live",
+                             {"timestamp": int(stamp.timestamp() * 1000), "auction_phase": "live",
+                              "data_status": "live", "item": [item], "_strategy_weights": weights})
+        value = self.daily.freeze(DAY, at("09:27:00"))
+        coverage = value["field_coverage"]
+        self.assertEqual(coverage["batches"], 3)
+        self.assertEqual(coverage["fields"]["auction_volume_ratio"]["batches_with_value"], 1)
+        self.assertEqual(coverage["fields"]["auction_volume_ratio"]["first_value_at"], at("09:16:00").isoformat())
+        self.assertIsNone(coverage["fields"]["open_price"]["last_value_at"])
+        self.assertEqual(coverage["fields"]["auction_turnover_pct"]["batches_with_value"], 3)
+        checkpoint = coverage["checkpoints"]["09:24:50"]["auction_volume_ratio"]
+        self.assertEqual((checkpoint["with_value"], checkpoint["candidate_count"]), (0, 1))
+        self.assertIsNone(checkpoint["last_value_at"])
+        self.assertEqual(coverage["checkpoints"]["09:24:50"]["auction_turnover_pct"]["with_value"], 1)
+        text = self.daily.export(DAY, format="markdown")[1]
+        self.assertIn("## 原始字段可得性", text)
+        self.assertIn("| auction_volume_ratio | 1 |", text)
+
+    def test_freeze_writes_one_ranking_markdown_summary(self):
+        self.seed()
+        value = self.daily.freeze(DAY, at("09:27:00"))
+        summary = self.daily.root / (DAY + "-auction.md")
+        text = summary.read_text(encoding="utf-8")
+        self.assertIn("# 每日竞价评分与收盘核验", text)
+        self.assertIn("| 名次 | 股票代码 | 名称 | 竞价评分 | 因子覆盖 | 竞价涨幅% | 竞价金额（元） | 严格连板 | 观察批次 | 当日涨停池成员 |", text)
+        self.assertIn("| 1 | 000001.SZ | 样本股 |", text)
+        self.assertIn("前五名：1. 000001.SZ 样本股", text)
+        self.assertIn("## 09:24:50", text)
+        self.assertIn("| 1 | 1 | 1 | 0 | 否 | 否 |", text)
+        initial = summary.read_bytes()
+        self.assertEqual(value, self.daily.freeze(DAY, at("16:00:00")))
+        self.assertEqual(initial, summary.read_bytes())
+        name, markdown = self.daily.export(DAY, format="markdown")
+        self.assertEqual(name, DAY + "-" + value["frozen_id"] + ".md")
+        self.assertEqual(markdown, summary.read_text(encoding="utf-8"))
+
+    def test_correction_rebuilds_a_session_frozen_before_the_metadata_fix(self):
+        self.seed_observed_upstream_names()
+        frozen = self.freeze_as_pre_fix_engine(self.daily)
+        frozen_path = self.daily.root / (DAY + "-auction.json")
+        before = frozen_path.read_bytes()
+        self.assertEqual([session["quality"]["scored_count"] for session in frozen["sessions"]], [0, 0])
+        with self.assertRaises(ValueError):
+            self.daily.correct(DAY, at("09:40:00"), "短")
+        value = self.daily.correct(DAY, at("09:40:00"), "上游阶段命名修复后按当日原批次重建评分")
+        self.assertEqual(value["kind"], "auction_snapshot_correction")
+        self.assertEqual(value["corrects_frozen_id"], frozen["frozen_id"])
+        self.assertEqual(value["reason"], "上游阶段命名修复后按当日原批次重建评分")
+        for session in value["sessions"]:
+            self.assertEqual(session["method"], "replayed")
+            self.assertEqual(session["quality"]["scored_count"], 1)
+            self.assertEqual(session["supersedes"]["scored_count"], 0)
+        self.assertEqual(before, frozen_path.read_bytes())
+        self.assertTrue((self.daily.root / (DAY + "-" + value["id"] + ".json")).exists())
+        text = (self.daily.root / (DAY + "-" + value["id"] + ".md")).read_text(encoding="utf-8")
+        self.assertIn("校正原因：上游阶段命名修复后按当日原批次重建评分", text)
+        self.assertIn("被校正的原冻结档案：" + frozen["frozen_id"], text)
+        self.assertIn("| 1 | 000001.SZ | 样本股 |", text)
+        original_text = (self.daily.root / (DAY + "-auction.md")).read_text(encoding="utf-8")
+        self.assertIn(f"竞价存档：{frozen['frozen_id']}", original_text)
+        self.assertIn("| — | 000001.SZ | 样本股 | — | 0% |", original_text)
+        self.assertEqual(self.daily.get(DAY)["id"], value["id"])
+        repeated = self.daily.correct(DAY, at("09:45:00"), "上游阶段命名修复后按当日原批次重建评分")
+        self.assertEqual(repeated, value)
+        self.assertEqual(len(self.daily.corrections(DAY)), 1)
+        self.assertEqual(frozen_path.read_bytes(), before)
+        self.assertEqual(original_text, (self.daily.root / (DAY + "-auction.md")).read_text(encoding="utf-8"))
+
+    def test_correction_needs_a_frozen_archive_and_a_finished_session(self):
+        self.seed()
+        with self.assertRaises(ValueError):
+            self.daily.correct(DAY, at("09:26:59"), "冻结前不能校正每日档案")
+        with self.assertRaises(ValueError):
+            self.daily.correct(DAY, at("09:40:00"), "没有冻结档案就不应创建版本")
+        self.assertEqual(self.daily.corrections(DAY), [])
+        self.assertFalse(list(self.daily.root.glob(DAY + "-*.json")))
+
+    def test_morning_ranking_view_stays_separate_from_the_frozen_archive(self):
+        session = {"engine_source_sha256": "b" * 64, "weights": dict(DEFAULT_WEIGHTS),
+                   "strategy_provenance": {"weights_source": "live_engine",
+                                           "weights_at": at("09:26:00").isoformat()},
+                   "rows": [
+                       {"thscode": CODE, "name": "样本股", "score": 71.5, "provisional_score": None,
+                        "previous_limit_up": True,
+                        "rank": 1, "auction_pct": 3.0, "auction_amount": 20_000_000, "continue_day_cnt": 2,
+                        "phase": "final", "quality": {"factor_coverage": 1.0, "observation_count": 5}},
+                       {"thscode": "600519.SH", "name": "缺失终态", "score": None, "provisional_score": 55.0,
+                        "previous_limit_up": False,
+                        "rank": None, "auction_pct": 4.0, "auction_amount": 30_000_000, "continue_day_cnt": None,
+                        "phase": "locked", "quality": {"factor_coverage": .9, "observation_count": 40}}],
+                   "warnings": ["本机已接收 2 个原始批次，其中上游未就绪 0 个；终态覆盖 1/2 只。"]}
+        with self.assertRaises(ValueError):
+            self.daily.publish_morning_ranking(DAY, at("09:24:00"), session)
+        with self.assertRaises(ValueError):
+            self.daily.publish_morning_ranking(DAY, at("09:26:00"), {**session, "rows": []})
+        value = self.daily.publish_morning_ranking(DAY, at("09:26:02"), session)
+        self.assertEqual(value["kind"], "live_ranking_view")
+        self.assertEqual(value["status"], "live_snapshot")
+        path = self.daily.morning_ranking_path(DAY)
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("# 早盘竞价排名", text)
+        self.assertIn("## 09:26:00 实时排名", text)
+        self.assertIn("| 1 | 000001.SZ | 样本股 | 是 | 71.5 | — |", text)
+        self.assertIn("| — | 600519.SH | 缺失终态 | 否 | — | 55.0 |", text)
+        self.assertIn("09:20后", text)
+        self.assertIn("不是不可变证据", text)
+        self.assertIn("| 2 | 2 | 1 | 0 | 否 | 否 |", text)
+        self.assertIn("范围：本机实时采集 2 只，其中昨日涨停候选 1 只", text)
+        self.assertEqual(text.count("本机已接收 2 个原始批次"), 1)
+        self.assertFalse((self.daily.root / (DAY + "-auction.json")).exists())
+        self.assertFalse((self.daily.root / (DAY + "-auction.md")).exists())
+        self.assertEqual([], self.daily.list())
+        refreshed = self.daily.publish_morning_ranking(
+            DAY, at("09:26:30"), {**session, "rows": [{**session["rows"][0], "score": 60.0}]})
+        self.assertEqual(refreshed["generated_at"], at("09:26:30").isoformat())
+        self.assertIn("| 1 | 000001.SZ | 样本股 | 是 | 60.0 | — |", path.read_text(encoding="utf-8"))
+        self.assertFalse(list(self.daily.root.glob(DAY + "-*.json")))
+
+    def test_label_after_correction_keeps_labels_on_rebuilt_scores(self):
+        self.seed_observed_upstream_names()
+        frozen = self.freeze_as_pre_fix_engine(self.daily)
+        correction = self.daily.correct(DAY, at("09:40:00"), "元数据归一化修复后重建当日评分")
+        frozen_path = self.daily.root / (DAY + "-auction.json")
+        before = frozen_path.read_bytes()
+        value = self.daily.label(report(), at("15:11:00"))
+        self.assertEqual(value["status"], "ready")
+        self.assertEqual(value["scores_basis"], "correction")
+        self.assertEqual(value["scores_source_id"], correction["id"])
+        self.assertEqual(value["auction_frozen_id"], frozen["frozen_id"])
+        for session, rebuilt in zip(value["sessions"], correction["sessions"]):
+            self.assertEqual(session["rows"][0]["score"], rebuilt["rows"][0]["score"])
+            self.assertIsNotNone(session["rows"][0]["score"])
+            self.assertTrue(session["rows"][0]["label"])
+        self.assertTrue(any("校正版本" in warning for warning in value["warnings"]))
+        self.assertEqual(before, frozen_path.read_bytes())
+        self.assertEqual(self.daily.get(DAY)["id"], value["id"])
 
 
 if __name__ == "__main__":

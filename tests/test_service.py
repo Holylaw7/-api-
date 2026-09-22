@@ -99,6 +99,73 @@ class ServiceTest(unittest.TestCase):
         self.service.collect_cycle('final',clock=lambda:instant(m=25))
         self.assertTrue(self.service.finalized)
 
+    def test_morning_ranking_markdown_publishes_right_after_0925(self):
+        service = self.service
+
+        class Provider:
+            def auction(self, codes, stage):
+                stamp = instant(m=24, s=50) if stage == 'live' else instant(m=25, s=3)
+                return dict(timestamp=int(stamp.timestamp()*1000),
+                            auction_phase='no_cancel' if stage == 'live' else 'matched',
+                            data_status='live' if stage == 'live' else 'final',
+                            item=[quote(codes[0])])
+        service.provider = Provider()
+        service.collect_cycle('live', clock=lambda: instant(m=24, s=50))
+        service.collect_cycle('final', clock=lambda: instant(m=25, s=3))
+        path = service.data_dir / 'research' / 'daily' / '2026-09-18-morning-ranking.md'
+        service._publish_morning_ranking(instant(m=25, s=30))
+        self.assertFalse(path.exists(), '09:25 内不应提前生成早盘排名')
+        service._publish_morning_ranking(instant(m=26, s=2))
+        text = path.read_text(encoding='utf-8')
+        self.assertIn('# 早盘竞价排名', text)
+        self.assertIn('## 09:26:00 实时排名', text)
+        self.assertIn('| 名次 | 股票代码 | 名称 | 昨日涨停候选 | 竞价评分 | 待核验分 |', text)
+        self.assertIn('000001.SZ', text)
+        self.assertIn('不是不可变证据', text)
+        self.assertIsNotNone(service.store.decision('2026-09-18', '09:26:00'))
+        archive = service.data_dir / 'research' / 'daily' / '2026-09-18-auction.json'
+        self.assertFalse(archive.exists(), '早盘排名不得创建冻结档案')
+        first = path.read_bytes()
+        service._publish_morning_ranking(instant(m=26, s=10))
+        self.assertEqual(first, path.read_bytes(), '同一分钟内 20 秒内不重复刷新')
+        service._publish_morning_ranking(instant(m=26, s=30))
+        self.assertNotEqual(first, path.read_bytes())
+        self.assertFalse((service.data_dir / 'research' / 'daily' / '2026-09-18-auction.md').exists())
+
+    def test_same_day_manifest_restores_saved_batches_without_network(self):
+        service = self.service
+        day = '2026-09-18'
+        context = {'000001.SZ': {'thscode':'000001.SZ', 'name':'测试证券',
+                                 'context_date':'2026-09-17', 'continue_day_cnt':1,
+                                 'continue_day_text':'首板'}}
+        service.store.freeze_manifest({
+            'date':day, 'mode':'live', 'prepared_at':day+'T09:05:00+08:00',
+            'previous_date':'2026-09-17', 'calendar':['2026-09-17',day],
+            'context':context, 'codes':['000001.SZ'], 'context_complete':True,
+            'point_in_time':True, 'source':'local_preparation',
+            'weights':dict(service.config['weights'])})
+        live_at = instant(m=20)
+        final_at = instant(m=25,s=3)
+        service.store.batch(day,'live',live_at.isoformat(),'live',
+            dict(timestamp=int(live_at.timestamp()*1000),auction_phase='no_cancel',data_status='live',
+                 item=[quote('000001.SZ')],_requested_codes=['000001.SZ'],
+                 _strategy_weights=dict(service.config['weights'])))
+        service.store.batch(day,'live',final_at.isoformat(),'final',
+            dict(timestamp=int(final_at.timestamp()*1000),auction_phase='matched',data_status='final',
+                 item=[quote('000001.SZ')],_requested_codes=['000001.SZ'],
+                 _strategy_weights=dict(service.config['weights'])))
+        service.prepared_date = None
+        service.session_date = None
+        service.engine.reset()
+        with patch('app.service.now_sh',return_value=instant(m=30)):
+            self.assertTrue(service._restore_local_session(day))
+        summary = service.engine.summary()
+        self.assertEqual(summary['scored_count'],1)
+        self.assertEqual(summary['not_ready_batches'],0)
+        self.assertEqual(summary['phase'],'final')
+        self.assertTrue(service.finalized)
+        self.assertIn('本机原始批次恢复分析',service.message)
+
     def test_wrong_date_final_cannot_mark_complete(self):
         class Provider:
             def auction(self,codes,stage):

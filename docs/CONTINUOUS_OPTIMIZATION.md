@@ -75,6 +75,8 @@ flowchart LR
 
 如果引擎尚未摄入截止之后的批次，服务保存当时真实排名，`method=recorded_ranking`。旧数据没有合格排名时，才按截止前批次和当时权重重放，`method=replayed`。两者必须分开陈述。
 
+09:25 过后约一分钟，服务还会写出 `data/research/daily/YYYY-MM-DD-morning-ranking.md`：它直接取每批到达后立即计算的引擎排名（含 `provisional_score`、数据阶段与是否为昨日涨停候选），在 09:26 分钟内最多每 20 秒刷新一次，并声明自己是可刷新视图、不是不可变证据。该文件不参与样本筛选，也不能被当作原始评分证据；收盘标签只挂在 09:27 冻结档案和之后的核验版本上。
+
 ### 2.4 09:27：冻结竞价档案
 
 `data/research/daily/YYYY-MM-DD-auction.json` 只写一次，核心字段：
@@ -85,10 +87,16 @@ kind: 'auction_snapshot'
 status: 'frozen'
 date, mode: 'live', frozen_at, frozen_id, scope: 'previous_limit_up_only'
 engine_source_sha256, manifest_sha256, batches_sha256, batch_count
-sessions[], definition, warnings[]
+field_coverage, sessions[], definition, warnings[]
 ```
 
-`sessions` 分别保存两个时点的权重、来源、每股七因子、分数、质量和缺失。其他 AI 没有创建或补写冻结档案的 HTTP 接口；缺盘前清单或真实批次时只返回 `unavailable`。
+`sessions` 分别保存两个时点的权重、来源、每股七因子、分数、质量和缺失。同一对象同时渲染出人读 `data/research/daily/YYYY-MM-DD-auction.md`（权重来源、覆盖、排名、因子覆盖与标签），Markdown 与冻结 JSON 都只写一次，供人直接查看当日排名，不需要先手动导出。其他 AI 没有创建或补写冻结档案的 HTTP 接口；缺盘前清单或真实批次时只返回 `unavailable`。
+
+`field_coverage` 按当日原始批次记录关键上游字段（量比、换手、相对昨日成交量比例、未匹配量、开盘价）的可得性：有值批次数、首次/最后有值时间，以及在 09:24:50 与 09:26:00 两个时点各有多少候选真正取值（按引擎“最新一次观察”语义）。它是判断某日能否进入“七因子齐全”共同样本的审计依据：2026-09-21 与 09-22 实测 `auction_volume_ratio` 只在开盘首条快照、个别换手缺失个股与完整终态整批响应中出现，主时点分别仅 0/77 与 1/103 候选有值，因此这两日不能作为七因子完整样本；缺失保持缺失，不用相对昨日成交量比例替代。
+
+**当前决定（2026-09-22，方案A）：** 保持缺失、不替代、不携带旧值，先积累证据。复核入口是只读工具 `python tools/field_coverage_report.py --days 10`（读本机 `batches` 与盘前清单，不联网、不写文件），逐日打印“量比 09:24:50 有值候选数/候选总数”“量比 09:26:00”“换手 09:24:50”与“七因子完整样本”判定。复核时应先看连续多日该列是否仍接近 0：若持续缺失，再在有界携带（须改因子语义与版本）、调整共同样本定义（须同步契约与测试，且不得放宽30日/300股日门槛）或向上游确认之间做正式变更；在作出决定前，任何AI不得自行改用其他字段、补造量比或改动样本门槛。
+
+已冻结档案只能被读取，不能被重写。若某日整日不可评分确实源于此后修复的归一化或实现缺陷，维护者可用只读本机数据的 `tools/rebuild_daily_ranking.py --date ... --reason ...` 生成独立校正版本：它按当日原始批次、当时权重和当前引擎源码重放，保留 `corrects_frozen_id`、`reason`、`supersedes` 与引擎摘要，并明确声明不是当时页面已发布的原分；重放后仍无可评分记录时拒绝写入。15:10 核验只在同一冻结档案的校正版本确有可评分行时把标签加到重建分数上，并记录 `scores_basis=correction`。校正不是补采：它不能把当时未观察的股票变成已观察，也不能把校正分数当作当时的实时发布记录。
 
 ### 2.5 15:10 后：只把收盘结果贴成标签
 

@@ -13,7 +13,7 @@ from statistics import median
 
 BUCKETS = ("1", "2", "3", "4", "5+", "unknown")
 WINDOW_DAYS = 10
-REASON_LIMIT = 12
+REASON_LIMIT = 30
 CODE_LIMIT = 10
 
 
@@ -266,7 +266,9 @@ def _reasons(current):
             "excluded_conflict_count": current["ambiguous_count"] if current["available"] else None,
             "group_count": len(groups) if current["available"] else None, "displayed_count": len(rows),
             "coverage_pct": _pct(known, total), "rows": rows,
-            "definition": "按官方limit_up_reason完整原文精确分组，同一股票仅入一组；占比以有有效原因文本的股票数为分母。按数量降序、原文升序展示前12组，每组至多10个代码。官方文本是来源描述，不是行业/概念归属、资金流或经独立验证的因果证明。",
+            "definition": (f"按官方limit_up_reason完整原文精确分组，同一股票仅入一组；占比以有有效原因文本的股票数为分母。"
+                           f"按数量降序、原文升序展示前{REASON_LIMIT}组，每组至多{CODE_LIMIT}个代码。"
+                           "官方文本是来源描述，不是行业/概念归属、资金流或经独立验证的因果证明。"),
             "warnings": warnings}
 
 

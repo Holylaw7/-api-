@@ -19,7 +19,7 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 | `report_library.py` | `ReportLibrary(store,data_dir)`；`list/get/markdown/save/read_markdown/save_ai/load_ai`，本机报告读取、原子保存和模式隔离，不调用行情接口 |
 | `insights.py` | `compare_reports(current,previous)->dict` 两期证据比较；`readiness(snapshot,internal=None)->dict` 本机状态诊断，均无网络或磁盘 I/O、不读取系统时钟 |
 | `sentiment.py` | `build_sentiment(report)->dict` 从留存完整池计算至多10日梯队矩阵、封单留存与原因原文分布；纯计算，无外部请求 |
-| `official_context.py` | `build_official_context(provider,date,should_stop=None)->dict` 显式日期的风向标与三类龙虎榜，最多4个业务分项；分项失败隔离、原始data保存在raw |
+| `official_context.py` | `build_official_context(provider,date,should_stop=None)->dict` 显式日期的风向标与三类龙虎榜，最多4个业务分项；收盘复盘自动调用，分项失败隔离、原始data保存在raw |
 | `sector_research.py` | `load_catalog(provider,should_stop=None)`、`search_catalog(rows,query)`、`validate_sector_codes(values)`；`build_sector_research(provider,codes,date,report=...,catalog=None,now=None,should_stop=None,progress=None)` 有界指定板块取数，不落盘、不调用模型 |
 | `sector_library.py` | `SectorLibrary(data_dir).save/get/latest`，按证据摘要保存和校验指定板块结果，独立绑定基报告版本 |
 
@@ -169,7 +169,7 @@ sentiment = {
 }
 ```
 
-矩阵至多10个目标日前交易日，完整池缺失或代码重复/无效时计数为null。`buckets`是字符串键且互斥；无法确认的高度单列unknown，窗口下限另计，1板下限不等于首板。封单分布剔除当前封单额大于峰值的异常；`above_100_count`独立于其他数值异常计数。原因保留完整原文，最多12组、每组最多10个代码，不解释为行业。
+矩阵至多10个目标日前交易日，完整池缺失或代码重复/无效时计数为null。`buckets`是字符串键且互斥；无法确认的高度单列unknown，窗口下限另计，1板下限不等于首板。封单分布剔除当前封单额大于峰值的异常；`above_100_count`独立于其他数值异常计数。原因保留完整原文，最多30组、每组最多10个代码，`group_count`保留总组数并对未展开部分给出提示，不解释为行业。
 
 `POST /api/reports/enrich`只允许live、非未来且已收盘、具备`raw.calendar`中目标日证据的已保存报告；报告版本必须匹配，09:10–09:26与复盘生成期间拒绝开始。返回`{ok,message,started}`，任务为`jobs.evidence`。按顺序读取显式`date`的风向标和`board_type=all/org/hot_money`三榜，每次新分项请求前检查模式、关闭和保护时段。`requests.attempted`统计业务分项调用，**不是HTTP尝试数**；provider可以按现有策略重试，最多4个分项不等于总共4次HTTP请求。
 
@@ -202,11 +202,13 @@ all/org的coverage按`scope='stock_items'`核对声明总条数与实际行数�
 
 `row`采用白名单：`thscode,ticker,name,range_days,limit_reason,concept_list`，其中limit_reason是涨跌停原因；金额元字段`net_value,org_net_value,hot_money_net_value,hot_money_item_net_value,buy_value,sell_value,amount`；原小数字段`change,net_rate,org_net_rate,hot_money_net_rate,hot_money_item_net_rate`及相应`change_pct,net_rate_pct,org_net_rate_pct,hot_money_net_rate_pct,hot_money_item_net_rate_pct`百分数字段；`hot_rank,org_buy_num,org_sell_num,hot_money_name,reported_hot_money_net_value,record_index,duplicate_record,quality`。游资从`hot_money_items[].rows`展开，上层`buying`保存为聚合净额，不能按子行再次累加。同股票同区间多记录保留并标注；不计算三榜、不同区间或概念金额合计。
 
-取消、全部不可用或持久化前版本冲突时原报告保留；原有ready补充不被新partial替换。可用补充通过完整报告深拷贝写入`official_context`、`sentiment`、`enriched_at`，不改变原复盘`status`。更新的是报告版本，不是盘前选股或竞价排名；旧AI附录随review_id变化失效。自动复盘只生成本机情绪结构，不调用这四个补充分项。
+取消、全部不可用或持久化前版本冲突时原报告保留；原有ready补充不被新partial替换。可用补充通过完整报告深拷贝写入`official_context`、`sentiment`、`enriched_at`，不改变原复盘`status`。更新的是报告版本，不是盘前选股或竞价排名；旧AI附录随review_id变化失效。
+
+生成复盘时（自动15:10与手动相同）`Service.run_review`也按这套显式日期、逐分项可取消的规则读取最多4个业务分项：可用则直接写入新报告的`official_context`，`partial`另加“部分缺失”警告，`unavailable`/`cancelled`/异常只加警告并保持原盘面状态；报告照常保存，`label()`与本地研究继续执行。龙虎榜通常在收盘当晚才发布，15:10 自动取得的分项可能暂为未就绪，可稍后点「联网补充官方观察」改为ready版本（旧ready不会被新partial覆盖）。
 
 提交前预检Markdown渲染；保存证据并同步内存版本、清除旧AI后才写Markdown文件。文件被占用等写入失败不回滚已保存证据，会提示可直接重试本机导出；不能声称JSON、SQLite、Markdown整体构成原子事务。
 
-Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summary`导出`sentiment`和`official_observations`显式白名单，不发送raw；每榜每区间进一步限10条，保留真实总数与截取提示。原有DeepSeek/OpenAI/custom服务商隔离、版本绑定和用户主动发送规则继续适用。
+Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summary`导出`sentiment`和`official_observations`显式白名单，不发送raw；列表最多60项（超过15万字节时依次降到30、10，并在`scope_note`声明），榜单另附`limit_up_scope`/`sectors_scope`的shown/available/total/truncated，龙虎榜每榜每区间进一步限10条，保留真实总数与截取提示。原有DeepSeek/OpenAI/custom服务商隔离、版本绑定和用户主动发送规则继续适用。
 
 `HiThinkProvider.rate_limit_status()->{rate_limited,cooldown_seconds}`只读本机状态；`APIError.retry_after_seconds`是安全数值元信息。同进程同Key的实例共享429/4001冷却，冷却中请求快速返回受控错误。常规重试尊重可解析的Retry-After；要求等待超过15秒时不截短后立即重试，而交给调用方稍后处理。竞价仍每批单次HTTP尝试。该兼容机制不表示官网保证提供Retry-After，也不保证特定吞吐或恢复时效。
 
@@ -216,7 +218,7 @@ Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summa
 
 行业和概念目录各全量读取，主进程缓存15分钟；代码须匹配该官方目录，纯代码、未知代码及重复选择拒绝，不根据别名猜映射。每次最多3板块，最新报价合并最多300代码、每批100；历史行情每板按代码顺序最多20，合并最多60个短日线请求。构建最多10次最近日或67次历史日业务调用，目录未命中另2次，provider重试另计。每次请求前后检查保护/取消，09:10–09:26不开始新的板块联网任务，竞价每批流程不调用该模块。
 
-结果含`date/mode/review_id/evidence_id/generated_at/status/boards/coverage/warnings/definition`；board保留当前成员依据、取数时间、日期及行情覆盖、指数趋势、样本统计、同行明细和涨停交集。当前成员不是历史组成；快照不能替代旧日行情；完整收盘池缺失时涨停未知；严格连板另有consecutive_known_count；net_flow保持null。JSON每板100同行/30涨停，页面20/20，LLM30/30；各层明示截断并保留统计原分母。模型经独立分层白名单`targeted_sectors`接收所选板块，不受`sectors_top30`排除。
+结果含`date/mode/review_id/evidence_id/generated_at/status/boards/coverage/warnings/definition`；board保留当前成员依据、取数时间、日期及行情覆盖、指数趋势、样本统计、同行明细和涨停交集。当前成员不是历史组成；快照不能替代旧日行情；完整收盘池缺失时涨停未知；严格连板另有consecutive_known_count；net_flow保持null。JSON每板100同行/30涨停，页面20/20，LLM60/60；各层明示截断并保留统计原分母。模型经独立分层白名单`targeted_sectors`接收所选板块，不受`sectors_top30`排除。
 
 `SectorLibrary`保存`data/sector-research/evidence/<id>.json`及`latest/<date>-<review_id>.json`指针。id为证据（排除自身id）的规范JSON SHA-256前24个十六进制字符，包含取数时间；校验读取上限8MiB。基报告对象及其review_id不变，旧证据可按id审计；不将新数据原地附加进基报告。报告重新生成后，原证据不自动成为新版本证据。模型发起前再次确认版本，AI附录保留问题、代码、证据编号与时间且全部转义。独立助手不因聊天或加载摘要隐式访问金融API。
 
@@ -264,8 +266,8 @@ Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summa
 | GET `/api/research/template` | schema_version=1空模板及字段说明，不含行情。 |
 | POST `/api/research/import` | `{dataset:{schema_version,provenance,sessions}}`；最多5MiB/40日，每日5000批/每批100股，累计120日。日期不可覆盖或与本机live混用；返回import_id/imported_days。 |
 | GET `/api/research/daily` | `{items:[...]}`每日档案目录。 |
-| GET `/api/research/daily?date=YYYY-MM-DD` | 最近核验版本，否则冻结竞价档；无档为unavailable。sessions区分method=recorded_ranking/replayed。 |
-| GET `/api/research/daily/export?date=...&format=markdown\|json` | 下载日档，无档不造报告。 |
+| GET `/api/research/daily?date=YYYY-MM-DD` | 最近核验版本，否则校正版本，再否则冻结竞价档；无档为unavailable。sessions区分method=recorded_ranking/replayed，校正版本另带corrects_frozen_id/reason/supersedes。 |
+| GET `/api/research/daily/export?date=...&format=markdown\|json` | 下载所选版本日档，无档不造报告；markdown按同一对象渲染排名汇总。 |
 | GET `/api/research/history?date=...` | 真实本机清单＋原始竞价序列白名单＋结果池；无清单/批次拒绝；结果池缺失为null。保护时段拒绝。 |
 | GET `/api/research/ai-dataset?id=<24hex>` | schema_version=1，scope=development_only，仅开发日期09:24:50、合格来源的rows/factors/label；不含保留日期明细或09:26终态。数据不足可能sessions为空。 |
 | POST `/api/research/proposals` | `{experiment_id,weights:{全部七键},source_model?,rationale?}`；仅归档，返回proposal_id/status=awaiting_future_validation/automatically_applied=false。不改配置、不调用付费模型。 |
@@ -274,5 +276,13 @@ Markdown包含情绪结构、已补充观察及缺失口径。LLM经`build_summa
 其余POST仍为64KiB上限。所有证券代码均为六位字符串加.SH/.SZ/.BJ；不从裸代码猜市场。导入provenance须明确观察时间、元金额、百分数单位和`point_in_time_attested=true`，不等于程序认证外部历史真实性。完整导入细节见`docs/BACKTEST.md`。
 
 `/api/state.research`仅含id/status/generated_at，不把全实验随SSE广播。每日自动核验在15:10后的收盘复盘完成后触发；核验失败单独报告，不抹去已完成的复盘。原始SQLite、竞价日档、实验JSON、Markdown及建议档案在本机data目录隔离保存。优化结果最多说明此数据和预设规则下的比较，不输出交易收益承诺。
+
+每日档案的 Markdown 汇总随冻结自动生成：09:27 写出 `data/research/daily/YYYY-MM-DD-auction.md`，15:10 后另写核验版本的 `YYYY-MM-DD-<24位ID>.md`；两者都由 `render_daily(record)` 纯计算渲染同一对象，不新增行情请求，也不再需要用户先点「保存 Markdown」。冻结与同名 Markdown 都只写一次，后续算法变化不会覆盖既有日档。
+
+09:25 后约一分钟先写实时视图：`Service._publish_morning_ranking(current)` 只在 09:26 分钟调用（同一分钟内最多每 20 秒一次），先由既有`_capture_due_decisions`补记到期时点快照（`research_decisions`的`INSERT OR IGNORE`语义不变），再以引擎当前逐批排名调用 `DailyValidation.publish_morning_ranking(day,now,session)`。该方法用 `render_morning_ranking(record)` 渲染并**原子替换** `data/research/daily/YYYY-MM-DD-morning-ranking.md`，记录 `kind=live_ranking_view`、`generated_at`、`checkpoint=09:26:00`、`method=live_ranking`，每行保留分数、`provisional_score`、因子覆盖、观察批次、数据阶段与是否为昨日涨停候选。它明确声明自己是可刷新视图：不新增`batches`记录、不创建或改写任何`*-auction.json`、不参与优化样本，也不能被当作原始评分证据；`/api/research/daily`与日档导出只读取冻结、校正与核验版本。
+
+冻结后才发现当日整日不可评分（例如上游阶段命名不在显式白名单内）时，`DailyValidation.correct(date,now,reason)` 按当日原始批次、当时权重与当前引擎源码重放，并写独立校正版本 `YYYY-MM-DD-<24位ID>.json/.md`：保留`corrects_frozen_id`、`reason`、`supersedes`、`correction_source_sha256`与`batch_count`，不修改原冻结文件；重放后仍无可评分记录则拒绝写入。随后的15:10标签只在同一冻结档案的校正版本确有可评分行时使用它，并记录`scores_basis=correction`、`scores_source_id`及原冻结`auction_frozen_id`。维护入口是 `python tools/rebuild_daily_ranking.py --date YYYY-MM-DD --reason "..."`：只读本机SQLite与批次，不联网、不调用模型、不写`batches`/`research_manifests`/`research_decisions`，因而不产生可冒充原始证据的新记录。
+
+冻结档案与校正版本都带 `field_coverage`：按当日原始批次统计`FIELD_AUDIT_FIELDS`（`auction_volume_ratio`、`auction_turnover_pct`、`auction_yesterday_ratio_pct`、`auction_unmatched`、`open_price`）在09:15–09:26窗口内“有值批次/首次/最后有值时间”，并按引擎“最新一次观察”语义给出两个时点各有多少候选真正取值。键缺失与null都不补造；该字段用于区分上游停发与本机解析问题（2026-09-21/22实测量比只在开盘首条快照、个别换手缺失个股和完整终态整批响应中出现），也是判断某日能否进入七因子共同样本的审计依据。
 
 当前没有提案验证、批准、拒绝、应用或回退端点；`POST /api/research/proposals`固定只归档`awaiting_future_validation`，`POST /api/config`也不会关联或更新提案。每日滚动研究在留出日期与`holdouts.json`既有日期重叠时降为`exploratory_holdout_reuse`，不能声称新的独立验证。持续优化的人工治理和未来闭环约束见`docs/CONTINUOUS_OPTIMIZATION.md`。

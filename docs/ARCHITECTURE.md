@@ -23,7 +23,7 @@ official_context.py → 手动、显式日期的风向标 / 龙虎榜 → 新版
 sector_research.py → 指定板块与成员取数 → sector_library.py → 独立证据档案
                                                 ↓
                             llm.py targeted_sectors → 一次可选模型生成
-daily_validation.py → 当日两时点评分冻结 → 收盘结果核验 → 每日版本档案
+daily_validation.py → 当日两时点评分冻结 → 每日排名 Markdown → 收盘结果核验 → 每日版本档案
 research_data.py → 有界历史JSON导入 → research.py → replay.py → AuctionEngine
                                               ↓
                                       optimization.py → 参数建议 / 实验JSON与Markdown
@@ -48,6 +48,8 @@ research_data.py → 有界历史JSON导入 → research.py → replay.py → Au
 
 当请求跨越 09:25 返回，保留真实接收时间，不倒填成 09:24:59。实时端点每批不在网络层重试，下一轮按调度重试；一般 REST 最多重试 3 次。限流和无效密钥不会立即重复轰炸接口。复盘在独立线程进行，09:10–09:26 禁止开始新的复盘任务。系统不宣称操作系统调度或网络具有硬实时保证。
 
+同日重启时优先重新核验官方日历和上一交易日池。若该请求暂时失败，但SQLite已有同日原始批次，且同日盘前清单完整保存了交易日历、上一交易日、候选代码和上下文，服务可只读恢复该会话并重放原始批次。恢复必须逐项核对日期、时区、代码、批次阶段及非未来接收时间；它不能用旧清单准备新交易日，也不会补造、删除或改写行情。
+
 关注池构建与观察引擎分离。`_rebuild_codes()` 在锁内根据 `manual`、`previous_limit_up`、`strong_trend` 合并，`all` 模式再加 `all_market`。增删自选只改成员和来源，不调用引擎reset；在途一轮使用已拷贝的代码列表，新加入者从下一轮开始。只有切换真实会话/演示或重建新会话才按恢复流程处理引擎。移除后若仍有自动来源则继续跟踪；旧观察保留。
 
 趋势池按截止日匹配上一交易日。`session_trends` 保留本次会话使用的旧池，收盘后新生成的下一次池不会反向改写本次竞价来源。纯自选模式不自动合入涨停或趋势池。趋势筛选以 `should_stop` 检查关闭和保护时段，中断后清除本次自动尝试标记以便稍后重试；同日已完成池不会被中断的partial结果覆盖。
@@ -57,6 +59,8 @@ research_data.py → 有界历史JSON导入 → research.py → replay.py → Au
 ## 增量计算契约
 
 `AuctionEngine.ingest(data, received_at, context)` 每收到一批调用一次。context 仅允许交易日前的上下文；同日/未来数据拒绝，避免盘前使用收盘后的已知涨停结果。上游 `null` 不补零；未匹配量因单位/方向未明确，不推断买压。
+
+元数据归一化使用已验证组合的显式白名单。除官网示例 `final/ready` 与早期实测 `closed/final` 外，真实交易日已核实 `order_entry/live`、`no_cancel/live`、`matched/final`；原始值保留在每条结果和SQLite批次中。新增未知值默认不可用，不能因 `item` 非空就绕过阶段校验。
 
 每条分数包含原值、子分数、权重、贡献、数据覆盖和质量说明。有重复请求、未就绪、迟到、缺值时保留诊断。分数和因子可供另一个 AI 使用，但必须一并传递质量说明。严格连板数不能从 `5天4板` 的计数直接推成 4 连板。
 
@@ -192,7 +196,7 @@ Service分开维护`review`、`latest_review`和`viewing_archive`。前者只代
 
 任务完成后深拷贝原报告，添加`official_context/sentiment/enriched_at`，先预检Markdown渲染，再检查模式、保护时段及已存报告指纹；随后写JSON、SQLite，替换仍匹配的当前视图及latest_review、清除旧AI，最后写Markdown。Markdown文件写入失败时新证据和版本仍已同步，错误提示用户关闭占用文件后直接重试本机保存，不再次取数。各文件的原子替换不等于JSON、SQLite、Markdown整体原子事务。取消、全部不可用、并发报告更新或已有ready补充将被partial覆盖时，原报告保留。原有行情`report.status`与`official_context.status`独立，补充成功不升级旧盘面完整性。新证据改变`review_id`，原AI结果不沿用；历史视图与latest_review继续各司其职。
 
-主程序和独立助手依然通过`llm.build_summary`输出同一递归白名单。新增`sentiment/official_observations`保留日期、样本、区间和缺失口径；龙虎榜每榜每区间进一步截取10条，不能称为完整名单。模型不接收raw、配置和未知上游字段。报告专属AI仍不混入今天竞价；DeepSeek、OpenAI和custom的配置、在途请求及结果隔离继续有效。
+主程序和独立助手依然通过`llm.build_summary`输出同一递归白名单。新增`sentiment/official_observations`保留日期、样本、区间和缺失口径；列表上限60项，`limit_up_scope`/`sectors_scope`给出shown/available/total/truncated，超过15万字节时先降30再降10并在`scope_note`声明，龙虎榜每榜每区间进一步截取10条，均不能称为完整名单。模型不接收raw、配置和未知上游字段。报告专属AI仍不混入今天竞价；DeepSeek、OpenAI和custom的配置、在途请求及结果隔离继续有效。
 
 `provider.pool`验证分页回显page/size、total/pages算术一致性、页间总数稳定性、每页应有数量及代码唯一性；空池允许总页数0或1。全市场价格按目录总量翻页，不能把某页有效行情为空当作完成；证券目录也检查跨页重复。接口变动或部分缺页应失败，不能静默缩成完整样本。
 
@@ -204,7 +208,13 @@ Service分开维护`review`、`latest_review`和`viewing_archive`。前者只代
 
 采集关键路径继续为逐批响应、原始保存、引擎更新和状态发布，模型与历史搜索不进入此路径。新批次保存 `_strategy_weights`；首次准备的日期、官方日历、完整前日池、采集范围与权重以 `INSERT OR IGNORE` 写入 `research_manifests`，之后重启或结果池不会覆盖当日盘前证据。两个固定截止时点保存引擎原排名到 `research_decisions`；遇下一批跨越截止时点，须先固定只含截止前数据的排名，再摄入该批。
 
-`daily_validation.py` 在 09:27 后整理 09:24:50 与 09:26:00 档案。存在当时的时点排名时直接保留，标 `method=recorded_ranking`；没有时点排名但有原记录权重时，按所标识引擎回放，标 `method=replayed`。两时点可能不同来源；旧权重回退另有 `legacy_fallback`，不将重放值伪装为实时日志。`*-auction.json` 只写一次，收盘核验深复制后加标签并形成独立版本，不重算、覆盖冻结分数。
+`daily_validation.py` 在 09:27 后整理 09:24:50 与 09:26:00 档案。存在当时的时点排名时直接保留，标 `method=recorded_ranking`；没有时点排名但有原记录权重时，按所标识引擎回放，标 `method=replayed`。两时点可能不同来源；旧权重回退另有 `legacy_fallback`，不将重放值伪装为实时日志。`*-auction.json` 与同名 `*-auction.md` 排名汇总都只写一次：Markdown 由同一份冻结对象渲染，列出权重来源、覆盖、排名、因子覆盖与标签，不额外请求行情。收盘核验深复制后加标签并形成独立版本，不重算、覆盖冻结分数。
+
+调度器另在 09:26 分钟写实时排名视图 `YYYY-MM-DD-morning-ranking.md`：`Service._publish_morning_ranking` 先补记到期时点快照，再取引擎当前逐批排名，经 `DailyValidation.publish_morning_ranking` 原子替换写入，最多每 20 秒刷新一次。该文件是明确标注的可刷新视图，不是证据，也不受冻结与校正规则约束；同一分钟没有写成时，09:27 冻结档案的 Markdown 仍提供同一排名。
+
+已冻结档案不可改写。确因归一化或实现缺陷导致整日不可评分时，`DailyValidation.correct(date,now,reason)` 才按当日原始批次、当时权重和当前引擎源码重放，写入独立 `*-<24位ID>.json/.md` 校正版本：它保留 `corrects_frozen_id`、`reason`、`supersedes` 与所用引擎摘要，并在 Markdown 中说明这不是当时页面已发布的原分。09:27 只能冻结一次，校正不能凭空生成日期，重放后仍无可评分记录时拒绝写入。`label()` 只有在更正版本属于同一冻结档案且确实有可评分行时才把收盘标签加到重建分数上，并记录 `scores_basis`、`scores_source_id` 与原冻结 `auction_frozen_id`。维护入口为 `tools/rebuild_daily_ranking.py`，只读本机 SQLite，不联网。
+
+冻结档案与校正版本还写 `field_coverage`：按原始批次统计量比、换手、相对昨日成交量比例、未匹配量与开盘价的有值批次数、首次/最后有值时间，以及两个时点真正取值的候选数（引擎“最新一次观察”语义）。它把“上游停发字段”和“本机解析失败”分开留证——2026-09-21/22 实测量比只在开盘首条快照、个别换手缺失个股与完整终态整批响应中出现——也直接解释为什么那两日的 09:24:50 只覆盖六因子、进不了七因子共同样本。
 
 运行中的官方交易日自动调度 09:27 日档；开启 `auto_review` 后，在配置时间（默认 15:10）生成收盘复盘，再尝试匹配同日完整涨停池并启动本机研究。手动复盘亦会尝试核验；缺盘前清单、批次或原权重则 unavailable。保护时段和退出取消继续有效，自动任务不是硬性时刻保证，停机期间未采的数据不能恢复。
 

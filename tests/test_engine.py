@@ -101,6 +101,24 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(data["auction_phase"], "closed")
         self.assertEqual(data["data_status"], "final")
 
+    def test_authenticated_trading_day_phase_names_are_accepted_and_preserved(self):
+        engine = AuctionEngine()
+        cases = [
+            ("09:15:00", "order_entry", "live", "cancellable"),
+            ("09:20:00", "no_cancel", "live", "locked"),
+            ("09:25:03", "matched", "final", "final"),
+        ]
+        for clock, upstream_phase, upstream_status, expected_phase in cases:
+            with self.subTest(upstream_phase=upstream_phase):
+                now = at(clock)
+                row = engine.ingest(batch(now, auction_phase=upstream_phase,
+                                          data_status=upstream_status), now)[0]
+                self.assertEqual(row["phase"], expected_phase)
+                self.assertEqual(row["data_status"], "ready")
+                self.assertEqual(row["raw_auction_phase"], upstream_phase)
+                self.assertEqual(row["raw_data_status"], upstream_status)
+                self.assertIsNotNone(row["score"])
+
     def test_actual_final_metadata_cannot_be_used_before_0925(self):
         engine = AuctionEngine()
         now = at("09:24:59")
@@ -110,6 +128,7 @@ class EngineTests(unittest.TestCase):
     def test_metadata_allowlist_does_not_guess_unknown_status_or_phase(self):
         for phase, status in [("mystery", "ready"), ("live", "mystery"),
                               ("live", "final"), ("closed", "live"),
+                              ("order_entry", "final"), ("matched", "live"),
                               (None, "ready"), ("final", "not_ready")]:
             with self.subTest(phase=phase, status=status):
                 metadata = normalize_auction_metadata({"auction_phase":phase, "data_status":status}, at("09:25:00"))

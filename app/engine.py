@@ -63,7 +63,7 @@ def auction_phase(now: datetime) -> str:
 
 
 def normalize_auction_metadata(data: dict, received_at: datetime) -> dict:
-    """Reconcile the documented final/ready and observed closed/final variants.
+    """Reconcile documented and observed upstream auction phase names.
 
     This validates metadata only. It does not prove the quote's trading date;
     the scheduler must still check the exchange calendar before requesting it.
@@ -71,8 +71,12 @@ def normalize_auction_metadata(data: dict, received_at: datetime) -> dict:
     """
     now = aware(received_at)
     raw_status, raw_phase = data.get("data_status"), data.get("auction_phase")
-    final_phase = raw_phase in ("final", "closed")
-    live_phase = raw_phase in ("live", "cancellable", "locked", "firm")
+    # The public example uses final/ready.  Real authenticated responses have
+    # also used order_entry/live, no_cancel/live and matched/final.  Keep this
+    # an explicit allowlist so a new or contradictory upstream state remains
+    # unavailable until its timing and meaning have been checked.
+    final_phase = raw_phase in ("final", "closed", "matched")
+    live_phase = raw_phase in ("live", "cancellable", "locked", "firm", "order_entry", "no_cancel")
     normalized_phase = "final" if final_phase else "live" if live_phase else "unknown"
     ready = (final_phase and raw_status in ("ready", "final") and now.time() >= time(9, 25)) or (live_phase and raw_status in ("ready", "live"))
     warning = None

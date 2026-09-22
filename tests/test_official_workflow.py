@@ -91,6 +91,54 @@ class OfficialWorkflowTests(unittest.TestCase):
             self.assertTrue(self.service.enrich_report(DATE,report_identity(self.service.saved_report(DATE))))
         return self.queued['evidence']
 
+    def run_automatic_review(self, provider, official_call, date=DATE):
+        """Queue and run one automatic review with the four-item fetch controlled."""
+
+        def enqueue(name, worker):
+            self.queued[name] = worker
+            return True
+
+        with patch.object(self.service, '_provider', return_value=provider), \
+                patch.object(self.service, '_job', side_effect=enqueue), \
+                patch('app.service.build_review', return_value=report(date)), \
+                patch.object(self.service.daily_validation, 'label', return_value={'status': 'unavailable'}), \
+                patch.object(self.service, '_save_markdown'), \
+                patch.object(self.service, 'run_research'), \
+                official_call:
+            self.service.run_review(date, automatic=True)
+            self.queued['review']()
+
+    def test_automatic_review_reads_the_four_official_sections(self):
+        provider = Mock()
+        provider.calendar.return_value = [PAST, DATE]
+        official = Mock(return_value=context('ready'))
+        self.run_automatic_review(provider, patch('app.service.build_official_context', official))
+        official.assert_called_once()
+        self.assertEqual(official.call_args.args[1], DATE)
+        self.assertTrue(callable(official.call_args.kwargs['should_stop']))
+        stored = self.service.store.get_report(DATE, 'live')
+        self.assertEqual(stored['official_context']['status'], 'ready')
+        self.assertFalse([warning for warning in stored['warnings'] if '官方补充观察' in warning])
+
+    def test_partial_official_observations_attach_with_a_warning(self):
+        provider = Mock()
+        provider.calendar.return_value = [PAST, DATE]
+        self.run_automatic_review(provider, patch('app.service.build_official_context',
+                                                  Mock(return_value=context('partial'))))
+        stored = self.service.store.get_report(DATE, 'live')
+        self.assertEqual(stored['official_context']['status'], 'partial')
+        self.assertTrue(any('官方补充观察部分缺失' in warning for warning in stored['warnings']))
+
+    def test_official_observation_failure_only_warns_and_keeps_the_report(self):
+        provider = Mock()
+        provider.calendar.return_value = [PAST, DATE]
+        self.run_automatic_review(provider, patch('app.service.build_official_context',
+                                                  Mock(side_effect=RuntimeError('boom'))))
+        stored = self.service.store.get_report(DATE, 'live')
+        self.assertNotIn('official_context', stored)
+        self.assertTrue(any('官方补充观察读取异常' in warning for warning in stored['warnings']))
+        self.assertEqual(stored['date'], DATE)
+
     def assert_original_saved(self):
         self.assertEqual(self.service.report_library.get(DATE,'live'),self.original)
         self.assertFalse((self.root/'reports'/f'{DATE}.json').exists())

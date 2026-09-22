@@ -69,6 +69,7 @@ class Service:
             research = {'status':'not_run'}
         self.research_summary = {k:research.get(k) for k in ('id','status','generated_at')}
         self.last_daily_attempt = None
+        self.morning_ranking_at = None
         self.recorded_decisions = set()
         self.engine_source_sha256 = hashlib.sha256((Path(__file__).parent/'engine.py').read_bytes()).hexdigest()
         self.lock = threading.RLock()
@@ -857,6 +858,59 @@ class Service:
             self.daily_validation.freeze(date,now_sh(),should_stop=lambda:self.shutdown.is_set() or self._auction_priority())
         return self._job('daily_validation',work)
 
+    def _publish_morning_ranking(self, current):
+        """Write the human-readable live ranking about a minute after 09:25.
+
+        The 09:26 minute publishes and refreshes the view from the engine's own
+        per-batch ranking, so the morning ranking is readable right after the
+        09:25 close instead of waiting for the 09:27 archive.  A refresh happens
+        at most every 20 seconds and only when the content actually changes.
+        Nothing here touches the frozen archive, the closing pool or the network;
+        if the whole minute is missed the 09:27 Markdown still carries the same
+        two checkpoints.
+        """
+        if self.mode != 'live' or (current.hour, current.minute) != (9, 26):
+            return
+        with self.lock:
+            last = self.morning_ranking_at
+            if last is not None and current - last < timedelta(seconds=20):
+                return
+        day = current.date().isoformat()
+        try:
+            self._capture_due_decisions(current)
+        except (ValueError, TypeError, OSError) as exc:
+            self.error('每日时点快照保存失败：' + str(exc)[:200])
+        with self.lock:
+            if self.session_date != day or self.engine.session_date != day or not self.codes:
+                return
+            try:
+                rows = self.engine.rankings(current)
+            except ValueError:
+                return
+            summary = self.engine.summary()
+            session = {
+                'engine_source_sha256': self.engine_source_sha256,
+                'weights': dict(self.engine.weights),
+                'strategy_provenance': {'weights_source': 'live_engine', 'weights_at': current.isoformat(),
+                                        'weight_changes': None, 'weight_change_scope': 'live_session',
+                                        'decision_differs_from_last_batch_weights': None,
+                                        'legacy_fallback': False},
+                'rows': rows,
+                'warnings': list(summary['warnings']) + [
+                    f"本机已接收 {summary['batches']} 个原始批次，其中上游未就绪 {summary['not_ready_batches']} 个；"
+                    f"终态覆盖 {len(self.final_codes)}/{len(self.codes)} 只，缺失数据未补造。"],
+            }
+        try:
+            self.daily_validation.publish_morning_ranking(day, current, session)
+        except (ValueError, OSError) as exc:
+            self.error('早盘排名 Markdown 未写入：' + str(exc)[:200])
+            return
+        with self.lock:
+            self.morning_ranking_at = current
+            self.message = (f'早盘竞价排名已按实时批次写入 '
+                            f'data/research/daily/{day}-morning-ranking.md；09:27 另存不可变档案')
+        self.touch()
+
     def _capture_due_decisions(self, captured_at):
         """Called with the collection lock before ingesting a later observation.
 
@@ -880,28 +934,115 @@ class Service:
                 engine_source_sha256=self.engine_source_sha256))
             self.recorded_decisions.add(key)
 
-    def _prepare(self):
-        provider = self._provider()
-        today = now_sh().date().isoformat()
-        self._progress('prepare', '读取交易日历与昨日涨停池')
-        days = sorted(set(provider.calendar()))
-        if not days:
-            raise ValueError('交易日历为空，不能确定交易日；已暂停自动采集')
-        previous = next((d for d in reversed(days) if d < today), None)
-        if not previous:
-            raise ValueError('未取得上一交易日，无法构建无未来数据的重点池')
+    def _restore_saved_batches_locked(self, today, codes, batches):
+        """Restore one already prepared live session; caller holds ``self.lock``."""
+        self.engine.reset()
+        self.provisional_rows.clear()
+        self.processed.clear()
+        self.final_codes.clear()
+        self.finalized = False
+        self.session_date = today
+        for received, stage, data in batches:
+            restored = self.engine.ingest(data, datetime.fromisoformat(received), self.context)
+            if stage == 'live':
+                self.provisional_rows.update({r['thscode']:r for r in restored})
+            accepted = [r for r in restored if r.get('updated_at') == received and r.get('data_status') == 'ready'
+                        and isinstance(r.get('auction_price'),(int,float)) and r['auction_price'] > 0]
+            seen = {r['thscode'] for r in accepted}
+            self.processed.update(seen & set(codes))
+            if stage == 'final':
+                self.final_codes.update({r['thscode'] for r in accepted if r.get('phase') == 'final'} & set(codes))
+        self.finalized = bool(codes) and set(codes).issubset(self.final_codes)
+
+    def _restore_local_session(self, today):
+        """Recover today's immutable preparation and raw batches after an API outage.
+
+        This is deliberately limited to a same-day manifest that already proved the
+        trading calendar and candidate context.  It never prepares a new day from a
+        cache and never invents observations missing from SQLite.
+        """
+        current = now_sh()
+        manifest = self.store.manifest(today)
+        batches = self.store.batches(today, 'live')
+        if not isinstance(manifest, dict) or not batches:
+            return False
+        try:
+            prepared = datetime.fromisoformat(manifest.get('prepared_at'))
+            days = sorted(set(manifest.get('calendar') or []))
+            previous = manifest.get('previous_date')
+            context = manifest.get('context')
+            codes = manifest.get('codes')
+            if (manifest.get('date') != today or manifest.get('mode') != 'live'
+                    or manifest.get('source') != 'local_preparation'
+                    or manifest.get('context_complete') is not True
+                    or prepared.tzinfo is None or prepared.date().isoformat() != today or prepared > current
+                    or today not in days or previous != next((d for d in reversed(days) if d < today), None)
+                    or not isinstance(context, dict) or not isinstance(codes, list) or not codes
+                    or len(codes) != len(set(codes))
+                    or any(not isinstance(code, str) or not re.fullmatch(r'[0-9]{6}\.(SH|SZ|BJ)', code) for code in codes)
+                    or any(not isinstance(row, dict) or row.get('context_date') != previous for row in context.values())):
+                return False
+            for received, stage, payload in batches:
+                stamp = datetime.fromisoformat(received)
+                if (stamp.tzinfo is None or stamp.date().isoformat() != today or stamp > current
+                        or stage not in ('live','final') or not isinstance(payload, dict)):
+                    return False
+        except (TypeError, ValueError):
+            return False
         with self.lock:
+            if self.mode != 'live':
+                return False
             self.days = days
             self.calendar_loaded_date = today
-        pool = provider.pool('limit-up', previous)
-        pool.sort(key=lambda r:-(strict_continuity(r) or 0))
-        context = {r['thscode']: dict(r, context_date=previous) for r in pool if r.get('thscode')}
-        universe = self.config['universe']
-        all_codes = []
-        if universe == 'all':
-            self._progress('prepare', '读取全市场证券目录，重点池优先采集')
-            tickers = provider.tickers()
-            all_codes = [r['thscode'] for r in tickers if r.get('thscode') and not r.get('end_date')]
+            self.context = copy.deepcopy(context)
+            self.prepared_date = today
+            self.all_codes = codes[:] if self.config['universe'] == 'all' else []
+            self._rebuild_codes()
+            restored_sources = self.sources
+            self.codes = codes[:]
+            self.sources = {}
+            for code in codes:
+                known = restored_sources.get(code, [])
+                if known:
+                    self.sources[code] = known
+                elif self.config['universe'] == 'all':
+                    self.sources[code] = ['all_market']
+                else:
+                    self.sources[code] = []
+            self._restore_saved_batches_locked(today, self.codes, batches)
+            self.message = (f'官方准备请求暂时失败；已从今日盘前清单和 {len(batches)} 个本机原始批次恢复分析，'
+                            '未补造或改写行情')
+        self.touch()
+        return True
+
+    def _prepare(self):
+        today = now_sh().date().isoformat()
+        try:
+            provider = self._provider()
+            self._progress('prepare', '读取交易日历与昨日涨停池')
+            days = sorted(set(provider.calendar()))
+            if not days:
+                raise ValueError('交易日历为空，不能确定交易日；已暂停自动采集')
+            previous = next((d for d in reversed(days) if d < today), None)
+            if not previous:
+                raise ValueError('未取得上一交易日，无法构建无未来数据的重点池')
+            with self.lock:
+                self.days = days
+                self.calendar_loaded_date = today
+            pool = provider.pool('limit-up', previous)
+            pool.sort(key=lambda r:-(strict_continuity(r) or 0))
+            context = {r['thscode']: dict(r, context_date=previous) for r in pool if r.get('thscode')}
+            universe = self.config['universe']
+            all_codes = []
+            if universe == 'all':
+                self._progress('prepare', '读取全市场证券目录，重点池优先采集')
+                tickers = provider.tickers()
+                all_codes = [r['thscode'] for r in tickers if r.get('thscode') and not r.get('end_date')]
+        except APIError as exc:
+            if self._restore_local_session(today):
+                self.error('官方准备请求失败；已安全恢复今日本机竞价分析：' + str(exc))
+                return
+            raise
         with self.lock:
             new_session = self.session_date != today or self.mode != 'live' or self.prepared_date is None
             self.context = context
@@ -917,23 +1058,7 @@ class Service:
                     codes=codes,context_complete=True,point_in_time=prepared.strftime('%H:%M:%S') <= '09:15:00',
                     source='local_preparation',weights=dict(self.config['weights'])))
             if new_session:
-                self.engine.reset()
-                self.provisional_rows.clear()
-                self.processed.clear()
-                self.final_codes.clear()
-                self.finalized = False
-                self.session_date = today
-                for received, stage, data in self.store.batches(today, 'live'):
-                    restored = self.engine.ingest(data, datetime.fromisoformat(received), self.context)
-                    if stage == 'live':
-                        self.provisional_rows.update({r['thscode']:r for r in restored})
-                    accepted = [r for r in restored if r.get('updated_at') == received and r.get('data_status') == 'ready'
-                                and isinstance(r.get('auction_price'),(int,float)) and r['auction_price'] > 0]
-                    seen = {r['thscode'] for r in accepted}
-                    self.processed.update(seen & set(codes))
-                    if stage == 'final':
-                        self.final_codes.update({r['thscode'] for r in accepted if r.get('phase') == 'final'} & set(codes))
-                self.finalized = bool(codes) and set(codes).issubset(self.final_codes)
+                self._restore_saved_batches_locked(today, codes, self.store.batches(today, 'live'))
             self.message = f'已准备 {len(codes)} 只股票；上一交易日 {previous}。每批返回立即更新排名'
             if not codes:
                 self.message = '当前股票池为空，请按股票代码添加关注；不使用示例证券替代'
@@ -1024,6 +1149,33 @@ class Service:
             report = build_review(provider, chosen, previous, progress=lambda s:self._progress('review',s))
             report['mode'] = 'live'
             report['config_weights'] = dict(self.config['weights'])
+            warnings = report.get('warnings')
+            warnings = warnings if isinstance(warnings, list) else []
+            report['warnings'] = warnings
+            # The closing review now reads the same four official sub-items the
+            # manual enrichment offers: one benchmark plus three dragon-tiger
+            # boards, always with this explicit date and cancellable before
+            # every request.  A missing sub-item only adds a warning; it never
+            # upgrades or blocks the market part of the report.
+            generation = self.demo_generation
+            def cancelled():
+                return (self.shutdown.is_set() or generation != self.demo_generation
+                        or self.mode != 'live' or self._auction_priority())
+            self._progress('review','读取短线竞价风向标与三类龙虎榜（显式日期，可取消）')
+            try:
+                official = build_official_context(provider, chosen, should_stop=cancelled)
+            except Exception:
+                official = None
+                warnings.append('官方补充观察读取异常，未写入报告；可在页面「联网补充官方观察」重试')
+            if official is not None:
+                if official.get('cancelled'):
+                    warnings.append('官方补充观察因停止或竞价保护时段中断，未写入报告；可在保护时段外重新补充')
+                elif official.get('status') == 'unavailable':
+                    warnings.append('官方补充观察本次不可用（风向标与三类龙虎榜均未取得）；缺失不视为零，可在保护时段外重新补充')
+                else:
+                    report['official_context'] = official
+                    if official.get('status') != 'ready':
+                        warnings.append('官方补充观察部分缺失，分层状态与覆盖见 official_context；不改变原盘面的缺口')
             report['sentiment'] = build_sentiment(report)
             self.store.report(chosen, 'live', report)
             atomic_json(self.data_dir / 'reports' / (chosen+'.json'), report)
@@ -1357,6 +1509,7 @@ class Service:
                 if current > boundary+timedelta(seconds=self.config['final_grace_seconds']) and not self.finalized:
                     with self.lock:
                         self.message = f'竞价窗口已结束。已收集 {len(self.processed)}/{len(self.codes)} 只，终态 {len(self.final_codes)}/{len(self.codes)}；缺失数据未补造'
+                self._publish_morning_ranking(current)
                 if current.strftime('%H:%M') >= '09:27' and self.last_daily_attempt != today:
                     self.last_daily_attempt = today
                     self._freeze_daily(today)

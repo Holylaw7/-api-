@@ -7,6 +7,18 @@ import urllib.request
 from .ai_gateway import complete
 
 
+# Bounded export sizes.  Lists are capped first, then re-capped when the whole
+# payload would still be too large for one request.  Every cap is disclosed to
+# the model through scope fields and scope_note; nothing is silently dropped.
+LIST_LIMIT = 60
+FALLBACK_LIST_LIMIT = 30
+HARD_LIST_LIMIT = 10
+# One 60-row limit-up board plus a 60-row sector board and the rest of the
+# whitelist stays around 120–130 KB for a real trading day, so the first tier
+# must sit above that; larger payloads still fall back to 30 and then 10 rows.
+MAX_SUMMARY_BYTES = 150_000
+
+
 # Recursively exported fields. Unknown fields remain local until reviewed here.
 MARKET_FIELDS = frozenset('''
 date mode phase status warnings thscode name score rank auction_pct auction_amount
@@ -66,7 +78,7 @@ def _clean(value, depth=0):
     if isinstance(value, str):
         return value[:1200]
     if isinstance(value, list):
-        return [_clean(item, depth + 1) for item in value[:30]]
+        return [_clean(item, depth + 1) for item in value[:LIST_LIMIT]]
     if isinstance(value, dict):
         return {key: _clean(item, depth + 1) for key, item in value.items() if key in MARKET_FIELDS}
     return None
@@ -95,7 +107,7 @@ def _sector_strings(value):
 
 
 def _targeted_sector_summary(value):
-    """Keep selected boards separate from the general top-30 market sample.
+    """Keep selected boards separate from the general top-list market sample.
 
     Each nested record has its own allowlist. Raw responses, model settings and
     arbitrary future fields cannot be exported by adding them to MARKET_FIELDS.
@@ -141,14 +153,55 @@ def _targeted_sector_summary(value):
         ):
             rows = source.get(field)
             rows = [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-            board[field] = [_sector_fields(row, fields) for row in rows[:30]]
+            board[field] = [_sector_fields(row, fields) for row in rows[:LIST_LIMIT]]
             board['coverage'][count_key] = len(board[field])
-            board['coverage'][truncation_key] = bool(board['coverage'].get(truncation_key) or len(rows) > 30)
+            board['coverage'][truncation_key] = bool(board['coverage'].get(truncation_key)
+                                                     or len(rows) > LIST_LIMIT)
         result['boards'].append(board)
     result['scope_note'] = ('指定板块由官方接口定向读取，不受普通板块榜前30名限制；'
-                            '最多3板块，每板成员与涨停成员各展示最多30条。'
+                            f'最多3板块，每板成员与涨停成员各展示最多{LIST_LIMIT}条。'
                             '统计须结合quote_scope及coverage；当前成分的历史表现不代表历史成分。')
     return result
+
+
+def _list_scope(value, declared=None):
+    """Shown/available/total for one bounded list, so the model never reads it as complete."""
+    rows = value.get('rows') if isinstance(value, dict) else value
+    rows = rows if isinstance(rows, list) else []
+    total = declared if isinstance(declared, int) and not isinstance(declared, bool) else len(rows)
+    shown = min(len(rows), LIST_LIMIT)
+    return {'shown': shown, 'available': len(rows), 'total': total, 'limit': LIST_LIMIT,
+            'truncated': bool(shown < len(rows) or shown < total)}
+
+
+def _recap(payload, limit):
+    """Re-cut the bounded lists when the whole payload must shrink further."""
+    for key in ('auction_top30', 'limit_up_top30', 'sectors_top30'):
+        value = payload.get(key)
+        if isinstance(value, list):
+            payload[key] = value[:limit]
+        elif isinstance(value, dict) and isinstance(value.get('rows'), list):
+            value['rows'] = value['rows'][:limit]
+    for key in ('limit_up_scope', 'sectors_scope'):
+        scope = payload.get(key)
+        if isinstance(scope, dict) and scope.get('shown'):
+            scope['shown'] = min(scope['shown'], limit)
+            scope['truncated'] = True
+    sentiment = payload.get('sentiment')
+    reasons = sentiment.get('reasons') if isinstance(sentiment, dict) else None
+    if isinstance(reasons, dict) and isinstance(reasons.get('rows'), list):
+        reasons['rows'] = reasons['rows'][:limit]
+        reasons['displayed_count'] = len(reasons['rows'])
+    targeted = payload.get('targeted_sectors')
+    for board in (targeted.get('boards') or []) if isinstance(targeted, dict) else []:
+        coverage = board.get('coverage') if isinstance(board.get('coverage'), dict) else {}
+        for field, count_key, truncation_key in (('members', 'shown_count', 'truncated'),
+                                                 ('limit_up_members', 'limit_up_shown_count', 'limit_up_truncated')):
+            rows = board.get(field)
+            if isinstance(rows, list):
+                board[field] = rows[:limit]
+                coverage[count_key] = len(board[field])
+                coverage[truncation_key] = True
 
 
 def build_summary(state):
@@ -158,6 +211,8 @@ def build_summary(state):
     auction = state.get('auction') or {}
     review = state.get('review') or {}
     stock = (state.get('stocks') or {}).get('analysis') or {}
+    limit_up = review.get('limit_up') if isinstance(review.get('limit_up'), dict) else {}
+    sectors = review.get('sectors') if isinstance(review.get('sectors'), dict) else {}
     payload = {
         'mode': _clean(state.get('mode', 'live')), 'observed_at': _clean(state.get('now')),
         'auction_date': _clean(auction.get('date')), 'auction_phase': _clean(auction.get('phase')),
@@ -166,22 +221,23 @@ def build_summary(state):
         'review': _clean({k: review.get(k) for k in ('date', 'generated_at', 'status', 'warnings', 'market', 'trend', 'promotion')}),
         'limit_up_top30': _clean(review.get('limit_up')),
         'sectors_top30': _clean(review.get('sectors')),
+        'limit_up_scope': _list_scope(limit_up, limit_up.get('count')),
+        'sectors_scope': _list_scope(sectors, (sectors.get('coverage') or {}).get('ranked_count')),
         'selected_stock': _clean({k: stock.get(k) for k in (
             'thscode', 'name', 'date', 'status', 'trend', 'trend_score', 'trend_factors',
             'trend_coverage', 'warnings', 'auction')}),
         'sentiment': _clean(state.get('review_sentiment') or review.get('sentiment')),
         'official_observations': _official_summary(review.get('official_context')),
         'targeted_sectors': _targeted_sector_summary(state.get('sector_research')),
-        'scope_note': '仅发送所选字段；榜单和各列表最多30项，不能当作全市场明细。'
+        'scope_note': (f'仅发送所选字段；榜单等列表最多{LIST_LIMIT}项，并另附shown/available/total与truncated，'
+                       '展示条数不是全市场或板块完整成员数量，未展开不代表不存在。')
     }
-    if len(json.dumps(payload, ensure_ascii=False)) > 100_000:
-        for key in ('auction_top30', 'limit_up_top30', 'sectors_top30'):
-            value = payload[key]
-            if isinstance(value, list):
-                payload[key] = value[:10]
-            elif isinstance(value, dict) and isinstance(value.get('rows'), list):
-                value['rows'] = value['rows'][:10]
-        payload['scope_note'] += '本次摘要较大，三个榜单进一步限制为前10项。'
+    if len(json.dumps(payload, ensure_ascii=False)) > MAX_SUMMARY_BYTES:
+        _recap(payload, FALLBACK_LIST_LIMIT)
+        payload['scope_note'] += f'本次摘要较大，榜单等列表进一步限制为前{FALLBACK_LIST_LIMIT}项。'
+    if len(json.dumps(payload, ensure_ascii=False)) > MAX_SUMMARY_BYTES:
+        _recap(payload, HARD_LIST_LIMIT)
+        payload['scope_note'] += f'本次摘要仍较大，榜单等列表只保留前{HARD_LIST_LIMIT}项。'
     return payload
 
 

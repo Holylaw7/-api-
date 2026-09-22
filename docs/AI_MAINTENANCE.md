@@ -85,7 +85,7 @@ npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes
 | `app/provider.py` | 同花顺官方 HTTP 适配 | HTTP 200 且 `code==0`；分页、限流、脱敏、禁止重定向 |
 | `app/storage.py` | SQLite 原始批次、报告、清单、时点决策 | `INSERT OR IGNORE` 冻结证据；live/demo 隔离 |
 | `app/replay.py` | 按时点重放历史批次 | 只摄入截止前接收记录；当天结果只作标签 |
-| `app/daily_validation.py` | 09:27 竞价冻结、15:10 后收盘核验 | 冻结分数与结果版本分开；不可变写入 |
+| `app/daily_validation.py` | 09:26 实时排名视图、09:27 竞价冻结（含原始字段可得性审计`field_coverage`）、15:10 后收盘核验、按原因重建的校正版本 | 冻结分数与结果版本分开；冻结与核验只写一次，实时视图明确非证据，校正不覆盖原档 |
 | `app/optimization.py` | 固定共同样本、时间切分、权重搜索 | 不随机拆股票；保留集只评价一次 |
 | `app/research.py` | 实验、AI开发集、导入、建议档案 | 开发集出口不泄露保留标签；建议不应用 |
 | `app/review.py` | 收盘盘面、涨停与板块结构 | 明确日期、完整性、分页和统计分母 |
