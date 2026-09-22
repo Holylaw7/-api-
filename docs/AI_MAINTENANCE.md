@@ -148,7 +148,7 @@ npx skills add HiThink-Tech/Financial-API --skill hithink-finance -g --yes
 4. 更新 `docs/VALIDATION.md`，分别写明：离线测试、真实认证、真实交易时段、付费模型、仍未验证事项。
 5. 运行 `python tools/build_release.py`；确认分发包没有 `data/`、`.env`、数据库、日志、聊天或真实 Key。
 6. 提交说明写最终行为、关键边界和验证结果。不要用“已优化”“准确率提高”代替实际样本、时期和指标。
-7. 推送远端：本机 `origin` 固定为 `git@github.com:Holylaw7/-api-.git`，`main` 跟踪 `origin/main`，后续直接 `git push` 即可。若所在网络拦截 22 端口，用官方 443 通道 `git remote set-url --push origin ssh://git@ssh.github.com:443/Holylaw7/-api-.git`，或在用户级 `~/.ssh/config` 写 `Host github.com` → `HostName ssh.github.com` / `Port 443`；凭据、`data/`、`work/` 与打包 ZIP 始终不入库。
+7. 推送远端：本机 `origin` 固定为 `git@github.com:Holylaw7/-api-.git`，`main` 跟踪 `origin/main`，后续直接 `git push` 即可。本机 22 端口被网络拦截，已在用户级 `~/.ssh/config` 把 `Host github.com` 指向官方 443 端点（`HostName ssh.github.com`、`Port 443`），`ssh -G github.com` 可核对；换机器时可临时用 `git remote set-url --push origin ssh://git@ssh.github.com:443/Holylaw7/-api-.git`，不要改仓库里的 fetch 地址。凭据、`data/`、`work/` 与打包 ZIP 始终不入库。
 
 ## 6. 数据备份与恢复
 
