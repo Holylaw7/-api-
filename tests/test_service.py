@@ -99,6 +99,41 @@ class ServiceTest(unittest.TestCase):
         self.service.collect_cycle('final',clock=lambda:instant(m=25))
         self.assertTrue(self.service.finalized)
 
+    def test_final_stage_keeps_refreshing_until_late_final_values_arrive(self):
+        service = self.service
+        service.config['batch_size'] = 10
+        calls = []
+
+        class Provider:
+            def auction(self, codes, stage):
+                calls.append(stage)
+                pct = 10.0 if len(calls) == 1 else 0.0   # 第一次 matched/final 仍是旧值，延后复核才拿到真值
+                return dict(timestamp=int(instant(m=25, s=3).timestamp()*1000), auction_phase='matched',
+                            data_status='final', item=[dict(quote(code), auction_pct=pct) for code in codes])
+        service.provider = Provider()
+        service.collect_cycle('final', clock=lambda: instant(m=25, s=3))
+        self.assertTrue(service.finalized)
+        first = {row['thscode']: row for row in service.engine.rankings(instant(m=25, s=4))}
+        self.assertEqual(first['000001.SZ']['auction_pct'], 10.0)
+        with patch.object(service, '_progress'):
+            service.collect_cycle('final', clock=lambda: instant(m=25, s=8))
+        self.assertEqual(calls, ['final', 'final'], '全部终态后仍须在补采窗口内复核')
+        second = {row['thscode']: row for row in service.engine.rankings(instant(m=25, s=9))}
+        self.assertEqual(second['000001.SZ']['auction_pct'], 0.0, '采用最新终值')
+        self.assertEqual(len(service.store.batches('2026-09-18')), 2, '复核轮同样逐批留证')
+
+    def test_final_refresh_does_not_run_after_the_extended_window(self):
+        service = self.service
+        service.config['batch_size'] = 10
+        service.config['final_grace_seconds'] = 110
+
+        class Provider:
+            def auction(self, codes, stage):
+                raise AssertionError('补采窗口结束后不得再请求')
+        service.provider = Provider()
+        service.collect_cycle('final', clock=lambda: instant(m=26, s=51))
+        self.assertEqual(service.engine.summary()['symbol_count'], 0)
+
     def test_morning_ranking_markdown_publishes_right_after_0925(self):
         service = self.service
 

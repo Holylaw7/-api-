@@ -10,7 +10,7 @@ DEFAULT_WEIGHTS = dict(gap=.15, amount=.15, turnover=.1, volume_ratio=.1,
                        late_momentum=.2, retention=.15, continuity=.15)
 DEFAULT = dict(poll_seconds=3, batch_size=100, universe='focus', watchlist=[],
                weights=DEFAULT_WEIGHTS, request_interval=.5, request_timeout=6,
-               auto_review=True, review_time='15:10', final_grace_seconds=60)
+               auto_review=True, review_time='15:10', final_grace_seconds=110)
 
 
 def load_config():

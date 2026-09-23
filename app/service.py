@@ -70,6 +70,7 @@ class Service:
         self.research_summary = {k:research.get(k) for k in ('id','status','generated_at')}
         self.last_daily_attempt = None
         self.morning_ranking_at = None
+        self.final_window_notice = None
         self.recorded_decisions = set()
         self.engine_source_sha256 = hashlib.sha256((Path(__file__).parent/'engine.py').read_bytes()).hexdigest()
         self.lock = threading.RLock()
@@ -1069,7 +1070,12 @@ class Service:
         started = time.monotonic()
         size = self.config['batch_size']
         with self.lock:
-            codes = [c for c in self.codes if stage != 'final' or c not in self.final_codes]
+            if stage == 'final':
+                pending = [c for c in self.codes if c not in self.final_codes]
+                # 官方终值可能晚于第一次 matched/final 才落定，补采窗口内继续按轮复核并采用最新值。
+                codes = pending or list(self.codes)
+            else:
+                codes = list(self.codes)
             generation = self.demo_generation
         for offset in range(0, len(codes), size):
             if not self.running or self.shutdown.is_set() or self.mode != 'live':
@@ -1503,12 +1509,14 @@ class Service:
                     self.collect_cycle('live')
                     next_poll = time.monotonic()+max(0,self.config['poll_seconds']-self.cycle_seconds)
                 boundary = current.replace(hour=9,minute=25,second=0,microsecond=0)
-                if boundary <= current <= boundary+timedelta(seconds=self.config['final_grace_seconds']) and not self.finalized and time.monotonic() >= max(next_poll,self.api_backoff_until):
+                if boundary <= current <= boundary+timedelta(seconds=self.config['final_grace_seconds']) and time.monotonic() >= max(next_poll,self.api_backoff_until):
                     self.collect_cycle('final')
                     next_poll = time.monotonic()+self.config['poll_seconds']
-                if current > boundary+timedelta(seconds=self.config['final_grace_seconds']) and not self.finalized:
+                if current > boundary+timedelta(seconds=self.config['final_grace_seconds']) and self.final_window_notice != today:
+                    self.final_window_notice = today
                     with self.lock:
-                        self.message = f'竞价窗口已结束。已收集 {len(self.processed)}/{len(self.codes)} 只，终态 {len(self.final_codes)}/{len(self.codes)}；缺失数据未补造'
+                        self.message = (f'竞价窗口已结束（含终值复核至 09:26:50）。已收集 {len(self.processed)}/{len(self.codes)} 只，'
+                                        f'终态 {len(self.final_codes)}/{len(self.codes)}；缺失数据未补造')
                 self._publish_morning_ranking(current)
                 if current.strftime('%H:%M') >= '09:27' and self.last_daily_attempt != today:
                     self.last_daily_attempt = today
