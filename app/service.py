@@ -93,7 +93,7 @@ class Service:
         self.all_codes = []
         self.metadata = self._read_json('stock-metadata.json', {})
         self.trend_pool = self._read_json('trend-pool.json', {})
-        self.session_trends = {}
+        self.session_trends = self._session_trends_snapshot(self._read_json('trend-pool-session.json', {}))
         self.stock_analysis = None
         self.query_code = None
         self.pending_stock = None
@@ -151,6 +151,23 @@ class Service:
                     and coverage.get('pool_days_available',0) == coverage.get('pool_days_requested')
                     and coverage.get('pool_days_requested',0) >= 5
                     and pool.get('evaluated_count') == pool.get('candidate_count'))
+
+    @staticmethod
+    def _session_trends_snapshot(value):
+        """Return a usable session trend-pool copy, or ``{}`` for untrusted cache content.
+
+        The snapshot only feeds candidate membership for the session whose previous
+        trading day matches its ``date``; anything else is ignored, never repaired
+        into shape and never mixed with the refreshed pool.
+        """
+        if not isinstance(value, dict) or not isinstance(value.get('date'), str) or not value['date']:
+            return {}
+        rows = value.get('rows', [])
+        if not isinstance(rows, list):
+            return {}
+        if any(not isinstance(row, dict) or not isinstance(row.get('thscode'), str) for row in rows):
+            return {}
+        return copy.deepcopy(value)
 
     def touch(self):
         with self.condition:
@@ -677,7 +694,7 @@ class Service:
             if previous is None and self.prepared_date:
                 previous = next((d for d in reversed(self.days) if d < self.prepared_date), None)
             if self.trend_pool.get('date') == previous:
-                self.session_trends = copy.deepcopy(self.trend_pool)
+                self._remember_session_trends(self.trend_pool)
             active_pool = self.trend_pool
             if self.trend_pool.get('date','') > (previous or '') and self.session_trends.get('date') == previous:
                 active_pool = self.session_trends
@@ -692,6 +709,26 @@ class Service:
         self.processed.intersection_update(self.codes)
         self.final_codes.intersection_update(self.codes)
         self.finalized = bool(self.codes) and set(self.codes).issubset(self.final_codes)
+
+    def _remember_session_trends(self, pool):
+        """Called under lock. Keep the trend pool this session was prepared with.
+
+        The pool written after the close belongs to the next session, so the copy
+        taken here is what keeps this session's ``strong_trend`` sources stable
+        when the trend cache is refreshed or the process restarts on the same
+        trading day.  Only this cache file is written: no batch, decision, frozen
+        archive or collected observation is created, changed or re-scored.
+        """
+        snapshot = self._session_trends_snapshot(pool)
+        if not snapshot or snapshot == self.session_trends:
+            return
+        self.session_trends = snapshot
+        if self.mode != 'live':
+            return
+        try:
+            atomic_json(self.data_dir / 'trend-pool-session.json', snapshot)
+        except OSError as exc:
+            self.error('会话趋势池快照未写入本机缓存：' + str(exc)[:200])
 
     def _resolve_stock(self, code):
         code = validate_code(code)
@@ -1400,7 +1437,9 @@ class Service:
             self.session_date = None
             self.prepared_date = None
             self.calendar_loaded_date = None
-            self.session_trends = {}
+            # Keep the persisted session pool: the refreshed pool belongs to the
+            # next session and must not replace this one's trend source.
+            self.session_trends = self._session_trends_snapshot(self._read_json('trend-pool-session.json', {}))
             self.processed.clear()
             self.final_codes.clear()
             self.finalized = False

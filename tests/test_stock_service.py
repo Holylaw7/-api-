@@ -60,6 +60,63 @@ class StockServiceTest(unittest.TestCase):
         self.service._rebuild_codes()
         self.assertEqual(self.service.codes,['000001.SZ'])
 
+    def _session_service(self):
+        """A second process view on the same data directory (no scheduler work)."""
+        service = Service(Path(self.tmp.name))
+        service.shutdown.set()
+        service.thread.join(2)
+        service.shutdown.clear()
+        service.days = ['2026-09-16','2026-09-17','2026-09-18']
+        service.calendar_loaded_date = '2026-09-18'
+        service.prepared_date = '2026-09-18'
+        service.session_date = '2026-09-18'
+        service.context = {'000001.SZ':dict(name='平安银行',context_date='2026-09-17')}
+        return service
+
+    def test_session_trend_pool_survives_same_day_restart(self):
+        s = self.service
+        self.assertEqual(json.loads((Path(s.data_dir)/'trend-pool-session.json').read_text())['date'],'2026-09-17')
+        # 收盘后刷新的下一次池（截止今天）属于下一会话，不能反向替换本会话来源
+        s.trend_pool = dict(date='2026-09-18',status='ready',rows=[{'thscode':'000333.SZ'}])
+        s._rebuild_codes()
+        self.assertIn('600519.SH',s.codes)
+        self.assertNotIn('000333.SZ',s.codes)
+        snapshot = json.loads((Path(s.data_dir)/'trend-pool-session.json').read_text())
+        self.assertEqual(snapshot['date'],'2026-09-17')
+        # 模拟同日重启：新进程只看到已刷新的 trend-pool.json，仍须保留本会话趋势来源
+        (Path(s.data_dir)/'trend-pool.json').write_text(json.dumps(s.trend_pool),encoding='utf-8')
+        restarted = self._session_service()
+        try:
+            self.assertEqual(restarted.trend_pool.get('date'),'2026-09-18')
+            restarted._rebuild_codes()
+            self.assertIn('600519.SH',restarted.codes)
+            self.assertEqual(restarted.sources['600519.SH'],['strong_trend'])
+            self.assertNotIn('000333.SZ',restarted.codes)
+        finally:
+            restarted.close()
+            restarted.store.close()
+
+    def test_session_trend_snapshot_rejects_other_dates_and_bad_content(self):
+        path = Path(self.service.data_dir)/'trend-pool-session.json'
+        path.write_text(json.dumps(dict(date='2026-09-16',rows=[{'thscode':'600519.SH'}])),encoding='utf-8')
+        stale = self._session_service()
+        try:
+            self.assertEqual(stale.session_trends.get('date'),'2026-09-16')
+            stale._rebuild_codes()
+            self.assertNotIn('600519.SH',stale.codes)
+        finally:
+            stale.close()
+            stale.store.close()
+        path.write_text(json.dumps([{'date':'2026-09-17'}]),encoding='utf-8')
+        broken = self._session_service()
+        try:
+            self.assertEqual(broken.session_trends,{})
+            broken._rebuild_codes()
+            self.assertEqual(broken.codes,['000001.SZ'])
+        finally:
+            broken.close()
+            broken.store.close()
+
     def test_hot_add_persists_verified_code_without_reset(self):
         s=self.service
         class Provider:
