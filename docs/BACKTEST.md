@@ -226,6 +226,7 @@ $auctionDevelopment | ConvertTo-Json -Depth 30
 | `data/research/imports.json` | 与原始实盘库隔离的历史导入及来源声明 |
 | `data/research/holdouts.json` | 已用于独立检验的日期台账，不应删除后重用 |
 | `data/research/proposals/建议ID.json` | 外部参数建议，仅归档，等待未来验证 |
+| `data/research/late-final/YYYY-MM-DD-*.json/.md` | 事后补录的当日集合竞价终值及与冻结档案的差异；仅当日可补录，只作人工核对，不是当时接收证据，也不参与评分/标签/优化 |
 | `data/research/latest.json` | 最近实验指针，不是历史原始数据 |
 
 程序不因调参主动删除原始批次；当前单次研究有最近 120 日与每日期 5,000 批的计算上限，超限明确排除，不代表旧记录被删除。请自行备份数据目录；磁盘、人工删除和硬件故障不由应用保证恢复。源码摘要标识当时实现，不等于保存整个历史源码，严格复现还应保留对应 Git 版本。

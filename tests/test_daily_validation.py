@@ -305,6 +305,29 @@ class DailyValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.daily.get("../config")
 
+    def test_late_final_snapshot_tool_refuses_other_dates_and_renders_differences(self):
+        import contextlib
+        import io
+
+        from tools import late_final_snapshot
+
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            code = late_final_snapshot.main(["--date", "2026-01-05", "--data-dir", str(self.root)])
+        self.assertEqual(code, 2)
+        self.assertIn("没有历史日期参数", buffer.getvalue())
+        self.assertFalse((self.root / "research" / "late-final").exists())
+        value = {"date": DAY, "retrieved_at": at("09:40:00").isoformat(), "source": "fixture",
+                 "upstream": {"auction_phase": "closed", "data_status": "final"}, "codes": 2,
+                 "comparison": {"frozen_archive": "x", "differences": 1,
+                                "rows": [{"thscode": CODE, "name": "样本股", "archive_pct": 9.9, "late_pct": 0.0,
+                                          "delta_pp": -9.9, "archive_amount": 100, "late_amount": 200}]},
+                 "definition": "仅人工核对", "warnings": ["不是原始证据"]}
+        text = late_final_snapshot.render_markdown(value)
+        self.assertIn("| 000001.SZ | 样本股 | 9.9 | 0.0 | -9.9 |", text)
+        self.assertIn("与冻结档案不同的股票：**1** 只", text)
+        self.assertIn("不是原始证据", text)
+
     def test_field_coverage_report_tool_summarizes_saved_batches(self):
         import contextlib
         import io
