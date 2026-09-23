@@ -10,7 +10,7 @@ Python 3.10+标准库，本机服务，无外部前端依赖。时间为上海UT
 | 基础数据 | `calendar()->list[str]` ISO日历；`tickers(asset_type='a-share')->list[dict]` 完整分页；`resolve_stock(code)->dict` 官方唯一精确A股匹配，含resolution来源；`stock_quote(codes)->dict` 单批显式代码快照 |
 | 行情和复盘源 | `pool(kind,date)->list[dict]`，kind为limit-up/limit-down/limit-break且分页完整；`auction(codes,stage)->dict` 原始响应，最多100个原始代码token且内部不重试；`market()->dict` 所有页及page_timestamps；`catalog(tag)`、`indices(codes)`、`members(code)`、`ladder()` |
 | 日线 | `historical(code,start,end,index=False,adjust='none')->dict`；股票趋势调用须显式adjust='forward'；`index_historical(code,start,end)`不带复权参数 |
-| `engine.py` | `AuctionEngine(weights=None)`；`ingest(data,received_at,context=None)->list[dict]` 每一批后立即更新排名；`rankings(now=None)`、`summary()`、`reset()`；context按完整代码映射并带前一交易日日期 |
+| `engine.py` | `AuctionEngine(weights=None)`；`ingest(data,received_at,context=None)->list[dict]` 每一批后立即更新排名；`rankings(now=None)`、`summary()`、`reset()`；context按完整代码映射并带前一交易日日期。竞价量比缺失时按同会话≤`VOLUME_RATIO_CARRY_SECONDS`(600秒)有界携带，因子内带`value_source/value_age_seconds/carried_from`，`summary()`给`volume_ratio_carried_count` |
 | `review.py` | `build_review(provider,date,previous_date,progress=None)->dict`；同步纯构建，service后台执行；保留raw来源，输出market/limit_up/ladder/sectors/trend/status/warnings |
 | `stocks.py` | `validate_code(code)->str`仅格式规范化，不能代替官方核验；`analyze_stock(provider,metadata,date,calendar,context=None)->dict` 单股一次前复权日线、最多40交易日；不请求当前快照或竞价 |
 | `selection.py` | `build_trend_pool(provider,date,calendar,report=None,progress=None,should_stop=None)->dict` 有限60候选/30入选；每次新取数前检查取消和09:10–09:26；只返回不写文件 |

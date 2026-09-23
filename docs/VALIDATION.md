@@ -2,7 +2,7 @@
 
 ## 当前状态索引
 
-当前源码主系统版本为 **1.7.0**，独立 AI 助手为 **1.2.0**。最新专项验收是本文末尾“1.7.11 2026-09-23 实盘链路与例行维护观察”；历史章节按发生顺序保留，早期关于凭据未保存、旧端口或旧版本的描述只代表当时状态，不能覆盖后来的验收结果。
+当前源码主系统版本为 **1.7.0**，独立 AI 助手为 **1.2.0**。最新专项验收是本文末尾“1.7.12 竞价量比上游核对与有界携带（方案D→B）验收”；历史章节按发生顺序保留，早期关于凭据未保存、旧端口或旧版本的描述只代表当时状态，不能覆盖后来的验收结果。
 
 面向后续 AI 的当前入口为 [AI 修改与维护手册](AI_MAINTENANCE.md)、[本机接口说明](API_REFERENCE.md) 和 [持续算法优化手册](CONTINUOUS_OPTIMIZATION.md)。截至本文更新，外部权重建议可归档但没有自动未来验证/批准/应用状态闭环；重复暴露留出日期的滚动实验只能作探索，不能写成新的独立验证。真实交易日 09:15—09:25 全程采集与策略经济效用仍未完成验收。
 
@@ -231,6 +231,15 @@
 - 回归：`tests/test_service.py` 覆盖保护时段、后台任务、成功路径（拒绝时不停止采集、成功后 `running=False`）；`tests/test_research_service.py` 覆盖 HTTP 路由：无重启入口返回 400 且不停采集，注入回调后触发一次并停止采集（不会真正退出进程）。全项目 540 项测试通过，`node --check static/app.js` 与 `git diff --check` 干净。
 - 真实重启验证（2026-09-23 09:5x）：在本机运行实例上先以脱离会话方式启动新版本（`health` 正常、`config.final_grace_seconds=110`），再直接调用 `POST /api/service/restart`：返回 `{ok:true,restarting:true,was_running:false,auto_start:false}`，约 5 秒后健康检查恢复、监听 PID 由 36632 变为 44908、`final_grace_seconds` 仍为 110、`running=false`（保持重启前的“已停止”状态），`data/startup.log` 记录 `[restart] spawn …--no-auto-start` / `spawned pid=44908` / `after 1.5s alive=True`。
 - 修正要点：重启线程必须**非 daemon**——`shutdown()` 会让 `serve_forever()` 立即返回，daemon 线程会在主线程退出时被杀，导致子进程根本派生不出来（首轮实测即为此现象，日志无任何记录）；改为非 daemon 后恢复正常。`serve()` 另加入最多 8 秒的有界端口重试，避免旧监听释放与子进程绑定之间的竞态。
+
+## 1.7.12 竞价量比上游核对与有界携带（方案D→B）验收（2026-09-23 晚）
+
+- 方案D（上游核对，结论：无替代来源）：官方完整指南 `llms-full.txt` 中 `volume_ratio` 只出现在集合竞价字段表（`auction_volume_ratio`），全文没有第二个量比字段或参数；实测 `GET /api/a-share/prices/snapshot` 的 item 字段只有 `high_price/last_price/low_price/open_price/prev_price/price_change/price_change_ratio_pct/thscode/ticker/turnover/volume`，**没有量比，也没有换手率**。因此实时阶段确实拿不到竞价量比，也没有可替换的官方接口。
+- 方案B（有界携带，已实现）：`engine.VOLUME_RATIO_CARRY_SECONDS=600`；当当前观察缺少 `auction_volume_ratio` 时，使用**同一会话内**该股票最近一次有效值且年龄 ≤600 秒，因子内记录 `value_source='carried'|'current'`、`value_age_seconds`、`carried_from`，质量提示写明“按有界携带使用 … 的值（约 N 分钟前，同一会话内）”，`summary()` 给 `volume_ratio_carried_count`。超过 600 秒（例如 09:25:20 的终态观察）、换日或从未取得有效值仍保持缺失；`auction_yesterday_ratio_pct` 继续不使用。
+- 证据链留痕：日档 `field_coverage.checkpoints[].volume_ratio_carried_rows` 记录每个时点有多少行使用携带值，Markdown 同步说明；实验 `sample_summary.volume_ratio_carried_rows`（含逐日 `days[].volume_ratio_carried_rows`）与实验警告披露携带行数；归档保留 `value_source/value_age_seconds/carried_from`；LLM 白名单新增 `value_source/value_age_seconds/carried_from/volume_ratio_carried_rows`；个股观测面板的因子提示显示携带来源与年龄。共同样本门槛（30 完整日/300 股票日/开发集正负各 30）不变，携带行按“有分即可”与原规则一致地计入。
+- 回归：`tests/test_engine.py` 新增“缺失量比在 600 秒内同会话携带、超过 600 秒与换日不携带”用例；`tests/test_daily_validation.py` 新增归档保留携带来源与 `volume_ratio_carried_rows`；`tests/test_optimization.py` 新增携带行计数与警告；`tests/test_llm_config.py` 的摘要白名单随字段扩展通过。全项目 **543 项自动测试通过**，`node --check static/app.js`、`node --check static/ai.js` 与 `git diff --check` 通过。
+- 真实批次复算（只重放 09:24:50 截止前批次、只读本机 SQLite，不使用收盘结果）：`2026-09-21` 候选 77、有界携带 77、**七因子齐全 77**（最大携带 9.8 分钟）；`2026-09-22` 候选 103、携带 97、齐全 **97**（9.6 分钟；其余 6 只开盘几秒内也没有有效量比，按规则保持缺失）；`2026-09-23` 候选 63、携带 63、齐全 **63**（9.7 分钟）。即方案B生效后主时点重新具备七因子共同样本，但携带行数与原始可得性分列，可由 `volume_ratio_carried_rows` 与 `field_coverage` 对照区分。
+- 边界：本轮只把“同一会话、600 秒内”的最后有效量比用于评分，不新增任何行情请求、不改权重、不改 09:24:50/09:26:00 时点定义、不改门槛；携带值可与上游真正下发量比的日期分开统计（`volume_ratio_carried_rows` 与 `field_coverage` 原始可得性并列阅读）。
 
 ## 1.7.11 2026-09-23 实盘链路与例行维护观察（2026-09-23 晚）
 

@@ -508,7 +508,8 @@
       const f = value && typeof value === 'object' ? value : {score: value};
       const label = f.label || factors[key]?.label || key;
       const missing = f.available === false || !numeric(f.score);
-      const tooltip = `分数 ${num(f.score, 1)} / 权重 ${ratio(f.weight)} / 贡献 ${num(f.contribution, 1)}${f.value === null || f.value === undefined ? '' : ` / 原值 ${f.value}`}`;
+      const carried = f.value_source === 'carried' ? ` / 同会话有界携带：约 ${num((Number(f.value_age_seconds) || 0) / 60, 1)} 分钟前的竞价量比（来源 ${f.carried_from || '未知'}）` : '';
+      const tooltip = `分数 ${num(f.score, 1)} / 权重 ${ratio(f.weight)} / 贡献 ${num(f.contribution, 1)}${f.value === null || f.value === undefined ? '' : ` / 原值 ${f.value}`}${carried}`;
       return `<div class="factor-row${missing ? ' missing' : ''}" title="${esc(tooltip)}"><span>${esc(label)}</span><div class="factor-track"><i style="width:${clamp(f.score)}%"></i></div><strong>${missing ? '缺失' : esc(num(f.score, 0))}</strong></div>`;
     }).join('');
     const items = state.history.length ? state.history : list(row.history);

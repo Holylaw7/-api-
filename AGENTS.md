@@ -113,7 +113,7 @@ Windows 双击入口的 `.cmd` 内容必须保持纯 ASCII 并使用 CRLF；中�
 - 情绪矩阵只使用已留存完整涨停池和日历，最多10日；官方天梯每板最多4只不能替代全池。缺失日不补零，区间边界为下限；1板下限不能宣称已确认首板。
 - 封单分布基于`seal_money/max_seal_money`，与竞价金额留存分开；缺值、峰值≤0、负值、当前额大于峰值均不参与。涨停原因按`limit_up_reason`完整原文精确分组，不拆成行业或推断因果。
 - `official_context.build_official_context`仅允许风向标及三类龙虎榜共4个业务分项，每次都传显式日期、请求前检查取消。收盘复盘（含自动15:10）现在也调用这4个分项：分项失败只写入报告警告与`official_context`分层状态，不阻塞复盘、不把原盘面partial升级为ready；晚间可用「联网补充官方观察」重试，已有ready不被新partial覆盖。provider常规重试可能增加HTTP次数；禁止改成自动扫描一年、成员表归因或竞价轮询内调用。
-- 竞价量比`auction_volume_ratio`：官方字段名已按官方文档核对无误，上游在实时阶段大多整键停发，09:24:50主时点常缺该因子。当前决定（2026-09-22，方案A）保持缺失、不用`auction_yesterday_ratio_pct`替代、不携带开盘前旧值冒充主时点；先用日档`field_coverage`与`python tools/field_coverage_report.py --days 10`积累逐日证据，几天后复核，再决定“有界携带/共同样本定义调整/向上游确认”，且不得借机放宽30日/300股日门槛。
+- 竞价量比`auction_volume_ratio`：官方字段名已核对无误，上游在实时阶段大多整键停发，行情快照也没有替代字段。当前决定（2026-09-23，方案D→B）：按**同一会话内、最近一次有效值且年龄≤600秒**有界携带参与评分，必须逐行保留`value_source='carried'`、`value_age_seconds`、`carried_from`，并在日档`field_coverage.checkpoints[].volume_ratio_carried_rows`、实验`sample_summary.volume_ratio_carried_rows`与实验警告中披露；超过600秒、跨日或从未取得有效值仍保持缺失，不得用`auction_yesterday_ratio_pct`替代、不得把携带值说成上游在09:24:50提供的量比、不得借此放宽30日/300股日门槛。逐日原始可得性仍用`python tools/field_coverage_report.py --days 10`审计。
 - `POST /api/reports/enrich`须校验live、已收盘、报告原始日历、日期、`review_id`和保护时段；任务键`evidence`。取消、全部失败、版本冲突保留原报告；已有ready补充不被partial覆盖。补充不能将原复盘`status`升级为ready。
 - 风向标`date`与`date_ms`须精确对应上海零点；`auction_pct`是百分数原值。样本均值、中位数和正涨比例不是全市场指标，标签不进入原竞价分。timestamp为组装时间，不用它证明交易日。
 - 龙虎榜核对`trade_date`和`board_type`，timestamp按目标日零点另作交叉检查；不一致或缺失保留原值并partial，不静默修改。官网示例时间戳与日期自身存在不一致，不能将示例数值硬编码为规则。

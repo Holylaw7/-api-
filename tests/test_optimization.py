@@ -32,6 +32,21 @@ def sessions(days=30, count=20):
 
 
 class OptimizationTests(unittest.TestCase):
+    def test_carried_volume_ratio_is_counted_and_disclosed(self):
+        data = sessions(2, 4)
+        for item in data:
+            for current in item["rows"]:
+                current["factors"]["volume_ratio"] = {"score": 50.0, "value_source": "carried",
+                                                     "value_age_seconds": 580,
+                                                     "carried_from": "2026-01-01T09:15:10+08:00"}
+        result = optimize_sessions(data, DEFAULT_WEIGHTS)
+        summary = result["sample_summary"]
+        self.assertEqual(summary["complete_days"], 2)
+        self.assertEqual(summary["volume_ratio_carried_rows"], 8)
+        self.assertEqual(summary["days"][0]["volume_ratio_carried_rows"], 4)
+        self.assertTrue(any("有界携带" in warning for warning in result["warnings"]),
+                        "使用携带值必须在实验警告里披露")
+
     def test_empty_has_no_recommendation_and_no_fake_zero_precision(self):
         result = optimize_sessions([], DEFAULT_WEIGHTS)
         self.assertEqual(result["status"], "insufficient_data")

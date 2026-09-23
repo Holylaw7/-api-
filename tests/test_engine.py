@@ -40,6 +40,28 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(len(second), 2)
         self.assertEqual(second[0]["thscode"], "600000.SH")
 
+    def test_missing_volume_ratio_is_carried_only_within_the_same_session_and_bound(self):
+        engine = AuctionEngine()
+        engine.ingest(batch(at("09:15:10"), [stock(auction_volume_ratio=3.5)]), at("09:15:10"))
+        row = engine.ingest(batch(at("09:24:50"), [stock(auction_volume_ratio=None)]), at("09:24:50"))[0]
+        factor = row["factors"]["volume_ratio"]
+        self.assertEqual(factor["value"], 3.5, "量比缺失时按有界携带使用同会话最后有效值")
+        self.assertEqual(factor["value_source"], "carried")
+        self.assertAlmostEqual(factor["value_age_seconds"], 580, delta=1)
+        self.assertIs(factor["available"], True)
+        self.assertTrue(any("有界携带" in flag for flag in row["quality"]["flags"]))
+        self.assertIsNotNone(row["score"])
+        self.assertEqual(row["data_status"], "ready")
+        self.assertEqual(engine.summary()["volume_ratio_carried_count"], 1)
+        beyond = batch(at("09:25:20"), [stock(auction_volume_ratio=None)],
+                       auction_phase="matched", data_status="final")
+        beyond_row = engine.ingest(beyond, at("09:25:20"))[0]
+        self.assertIsNone(beyond_row["factors"]["volume_ratio"]["value"], "超过 600 秒不得继续携带")
+        self.assertIsNone(beyond_row["factors"]["volume_ratio"]["value_source"])
+        other = batch(at("09:15:05", date="2026-09-21"), [stock(auction_volume_ratio=None)])
+        other_row = engine.ingest(other, at("09:15:05", date="2026-09-21"))[0]
+        self.assertIsNone(other_row["factors"]["volume_ratio"]["value"], "新会话不得沿用上一日携带值")
+
     def test_phase_boundary_and_peak_amount_retention(self):
         engine = AuctionEngine()
         for clock, amount in [("09:15:00", 10_000_000), ("09:19:59", 20_000_000)]:

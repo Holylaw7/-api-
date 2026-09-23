@@ -305,6 +305,25 @@ class DailyValidationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.daily.get("../config")
 
+    def test_frozen_archive_keeps_carried_volume_ratio_provenance(self):
+        self.store.freeze_manifest(manifest())
+        weights = dict(DEFAULT_WEIGHTS)
+        for clock, ratio in (("09:16:00", 4), ("09:24:40", None)):
+            stamp = at(clock)
+            self.store.batch(DAY, "live", stamp.isoformat(), "live", {
+                "timestamp": int(stamp.timestamp() * 1000), "auction_phase": "live", "data_status": "live",
+                "item": [{"thscode": CODE, "name": "样本股", "auction_pct": 2, "auction_amount": 20_000_000,
+                          "auction_turnover_pct": .3, "auction_volume_ratio": ratio}],
+                "_strategy_weights": weights})
+        value = self.daily.freeze(DAY, at("09:27:00"))
+        factors = value["sessions"][0]["rows"][0]["factors"]["volume_ratio"]
+        self.assertEqual(factors["value"], 4)
+        self.assertEqual(factors["value_source"], "carried")
+        self.assertIsNotNone(factors["carried_from"])
+        self.assertEqual(value["field_coverage"]["checkpoints"]["09:24:50"]["volume_ratio_carried_rows"], 1)
+        text = self.daily.export(DAY, format="markdown")[1]
+        self.assertIn("有界携带", text)
+
     def test_late_final_snapshot_tool_refuses_other_dates_and_renders_differences(self):
         import contextlib
         import io

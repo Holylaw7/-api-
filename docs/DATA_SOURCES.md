@@ -84,7 +84,7 @@
 
 2026-09-22 按官方完整指南与 [GitHub 集合竞价文档](https://github.com/HiThink-Tech/Financial-API/blob/main/docs/api/a-share/auction-snapshot.md) 逐字核对 `auction_volume_ratio`：官方字段表把它列为常规 item 字段（`auction_turnover_pct / auction_yesterday_ratio_pct / auction_volume_ratio` = 竞价换手率、相对昨日成交量比例与**竞价量比**），示例是 `final/ready` 且同时含换手、昨比、量比与 `open_price`；文档没有任何“盘中不返回”或替代键名的说明。同时核对本机 2026-09-21 与 2026-09-22 全部原始批次：两日实测 item 键集合与官方 15 个字段完全一致，没有文档外字段，量比缺失的批次里其余 14 个字段齐全——即**是整键缺失，不是本机命名或解析错误**。逐日可得性由日档 `field_coverage` 自动记录：2026-09-21 量比仅在 11/187 批出现（09:15:00 首条与 09:25:54 完整终态），09:24:50 候选 0/77 有值；2026-09-22 为 215/395 批（含换手算不出而整日只给量比的个别个股），09:24:50 候选 1/103、09:26:00 候选 2/103 有值。本机按“缺失保持缺失”处理，不补造、不把相对昨日成交量比例当量比。
 
-该缺失的当前处理决定（2026-09-22，方案A）：保持缺失，不用其他字段替代，也不把开盘前旧值带进09:24:50；先用 `field_coverage` 与只读汇总工具 `python tools/field_coverage_report.py --days 10` 积累逐日证据，几天后复核再决定是否调整因子或共同样本定义。复核前不得据此改动权重、评分口径或优化门槛。
+该缺失的处理决定（2026-09-23 更新，方案B）：先做方案D核对——官方完整指南中 `volume_ratio` 仅出现在集合竞价字段表，行情快照 `prices/snapshot` 实测字段只有 high/low/last/open/prev/price_change/price_change_ratio_pct/volume/turnover 等，**没有量比或换手率**，因此没有可用的替代接口来源；随后执行方案B：竞价量比按同一会话内、最近一次有效值且年龄≤600秒有界携带参与评分，因子内保留 `value_source=carried`、`value_age_seconds`、`carried_from`，日档 `field_coverage.checkpoints[].volume_ratio_carried_rows` 与实验 `sample_summary.volume_ratio_carried_rows` 分别统计，实验警告明确披露；超过600秒、跨日或从未取得有效值仍保持缺失，不用相对昨日成交量比例替代。逐日原始可得性继续用 `python tools/field_coverage_report.py --days 10` 审计。
 
 常规接口对网络错误、HTTP 429/部分5xx、业务4001/5001/5002/5003最多额外重试3次，基础指数退避0.5、1、2秒。兼容`Retry-After`的秒数及HTTP日期格式；如果要求等待超过15秒，不把它截短为15秒再立即重试，而返回受控错误供调用方以后处理。常规默认超时6秒。1xxx/2xxx、3002等不进行内部盲重试。
 

@@ -92,10 +92,10 @@ def _prepare(sessions, should_stop):
                     and item.get("checkpoint") == CHECKPOINT
                     and not (isinstance(item.get("quality"), dict)
                              and item["quality"].get("eligible_for_optimization") is False))
-    clean, day_diagnostics = [], []
+    clean, day_diagnostics, carried_rows = [], [], 0
     for session in sessions:
         if should_stop and should_stop():
-            return clean, diagnostics, missing, day_diagnostics, True
+            return clean, diagnostics, missing, day_diagnostics, True, carried_rows
         if not isinstance(session, dict):
             diagnostics["invalid_session"] += 1
             continue
@@ -124,6 +124,7 @@ def _prepare(sessions, should_stop):
                          if isinstance(row, dict) and isinstance(row.get("thscode"), str))
         kept, excluded = [], Counter()
         complete = True
+        day_carried = 0
         for row in raw_rows:
             diagnostics["input_rows"] += 1
             if not isinstance(row, dict) or not isinstance(row.get("thscode"), str) or not CODE.fullmatch(row["thscode"]):
@@ -145,6 +146,10 @@ def _prepare(sessions, should_stop):
                 continue
             factors = row.get("factors")
             factors = factors if isinstance(factors, dict) else {}
+            ratio_entry = factors.get("volume_ratio")
+            if isinstance(ratio_entry, dict) and ratio_entry.get("value_source") == "carried":
+                day_carried += 1
+                carried_rows += 1
             values = {}
             for key in FACTOR_KEYS:
                 entry = factors.get(key)
@@ -162,12 +167,13 @@ def _prepare(sessions, should_stop):
         day_diagnostics.append({
             "date": day, "input_rows": len(raw_rows), "common_rows": len(kept),
             "complete": complete, "excluded": dict(sorted(excluded.items())),
+            "volume_ratio_carried_rows": day_carried,
         })
         if kept:
             clean.append({"date": day, "rows": kept, "complete": complete})
     clean.sort(key=lambda item: item["date"])
     day_diagnostics.sort(key=lambda item: item["date"])
-    return clean, diagnostics, missing, day_diagnostics, False
+    return clean, diagnostics, missing, day_diagnostics, False, carried_rows
 
 
 def _row_score(row, weights, baseline=False):
@@ -283,7 +289,7 @@ def optimize_sessions(sessions, baseline_weights, *, top_k=10, should_stop=None)
     if isinstance(top_k, bool) or not isinstance(top_k, int) or not 1 <= top_k <= 100:
         raise ValueError("top_k必须是1至100的整数")
     baseline_weights = _normalize(baseline_weights)
-    clean, excluded, missing, day_diagnostics, cancelled = _prepare(sessions, should_stop)
+    clean, excluded, missing, day_diagnostics, cancelled, carried_rows = _prepare(sessions, should_stop)
     complete = [session for session in clean if session["complete"]]
     row_count = sum(len(session["rows"]) for session in complete)
     positive_count = sum(row["label"] for session in complete for row in session["rows"])
@@ -298,6 +304,7 @@ def optimize_sessions(sessions, baseline_weights, *, top_k=10, should_stop=None)
             "negative_count": row_count - positive_count, "required_days": MIN_DAYS,
             "required_rows": MIN_ROWS, "required_class_rows": MIN_CLASS_ROWS,
             "excluded": dict(sorted(excluded.items())), "missing_factors": dict(missing),
+            "volume_ratio_carried_rows": carried_rows,
             "days": day_diagnostics, "dataset_id": fingerprint,
             "definition": "完整日须代码唯一且标签均已核验；全部候选只评价原基线可排名、七因子分均完整的固定共同股日。",
         },
@@ -312,6 +319,11 @@ def optimize_sessions(sessions, baseline_weights, *, top_k=10, should_stop=None)
         ],
         "definition": DEFINITION,
     }
+    if carried_rows:
+        result["warnings"].append(
+            f"共同样本中有 {carried_rows} 个股票日使用同会话有界携带的竞价量比（上游实时阶段停发该字段，"
+            "按 600 秒内最后有效值参与评分）；逐行保留 value_source/carried_from，可与上游真正下发量比的日期分开比较，"
+            "不把携带值当作 09:24:50 当时由上游提供的量比。")
     if cancelled:
         result["status"] = "cancelled"
         result["recommendation"]["reason"] = "实验已取消，未生成或应用新权重。"

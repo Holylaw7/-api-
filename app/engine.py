@@ -11,6 +11,10 @@ import re
 from datetime import datetime, time, timedelta, timezone
 
 SHANGHAI = timezone(timedelta(hours=8))
+# The upstream stops sending auction_volume_ratio seconds into the live phase, so
+# the primary 09:24:50 checkpoint carries the last value seen in the same session
+# for at most this long, and every ranking row records that it was carried.
+VOLUME_RATIO_CARRY_SECONDS = 600
 DEFAULT_WEIGHTS = {
     "gap": .15, "amount": .15, "turnover": .10, "volume_ratio": .10,
     "late_momentum": .20, "retention": .15, "continuity": .15,
@@ -248,10 +252,10 @@ class AuctionEngine:
                     previous["attempt_at"] = now
                     previous["metadata"] = metadata
                 else:
-                    self._states[code] = self._new_state(row, now, assembled, phase, status, invalid, fingerprint, metadata)
+                    self._states[code] = self._new_state(row, now, assembled, phase, status, invalid, fingerprint, metadata, previous)
                     self.history[code] = []
                 continue
-            state = self._new_state(row, now, assembled, phase, status, invalid, fingerprint, metadata)
+            state = self._new_state(row, now, assembled, phase, status, invalid, fingerprint, metadata, previous)
             if previous:
                 state["changed"] = previous["changed"] + (fingerprint != previous["fingerprint"])
             else:
@@ -269,12 +273,43 @@ class AuctionEngine:
             self._compute_factors(code)
         return self.rankings(now)
 
-    def _new_state(self, row, now, assembled, phase, status, invalid, fingerprint, metadata):
+    def _new_state(self, row, now, assembled, phase, status, invalid, fingerprint, metadata, previous=None):
+        carry = (previous or {}).get("volume_ratio_last")
         return {"row": row, "received": now, "attempt_at": now, "assembled": assembled,
                 "phase": phase, "data_status": status, "invalid": invalid,
                 "fingerprint": fingerprint, "changed": 0, "values": {}, "scores": {},
                 "normalization_pct": None, "late_span": 0, "late_points": 0,
-                "covered_seconds": 0, "first_observed_at": None, "metadata": metadata}
+                "covered_seconds": 0, "first_observed_at": None, "metadata": metadata,
+                "volume_ratio_last": copy.deepcopy(carry) if isinstance(carry, dict) else None,
+                "volume_ratio_source": None, "volume_ratio_age_seconds": None,
+                "volume_ratio_carried_from": None}
+
+    @staticmethod
+    def _volume_ratio_value(state):
+        """Current auction volume ratio, or a bounded carry of the last one seen.
+
+        Only the code's own observations from this session are eligible, the age
+        must stay within ``VOLUME_RATIO_CARRY_SECONDS`` and the caller always
+        keeps the provenance, so a carried value can never be mistaken for a
+        value the upstream actually delivered at the decision time.
+        """
+        current = state["row"]["auction_volume_ratio"]
+        if current is not None:
+            return current, "current", 0.0, None
+        carry = state.get("volume_ratio_last")
+        if not isinstance(carry, dict):
+            return None, None, None, None
+        value = finite_number(carry.get("value"))
+        if value is None:
+            return None, None, None, None
+        try:
+            at = aware(datetime.fromisoformat(str(carry.get("at"))))
+        except (TypeError, ValueError):
+            return None, None, None, None
+        age = (state["received"] - at).total_seconds()
+        if not 0 <= age <= VOLUME_RATIO_CARRY_SECONDS:
+            return None, None, None, None
+        return value, "carried", age, at.isoformat()
 
     @staticmethod
     def _assembly_time(value):
@@ -333,9 +368,15 @@ class AuctionEngine:
         values["turnover"] = row["auction_turnover_pct"]
         if values["turnover"] is not None:
             scores["turnover"] = clamp(values["turnover"] / .6 * 100)
-        values["volume_ratio"] = row["auction_volume_ratio"]
-        if values["volume_ratio"] is not None:
-            scores["volume_ratio"] = clamp(100 * math.log1p(values["volume_ratio"]) / math.log(11))
+        if row["auction_volume_ratio"] is not None:
+            state["volume_ratio_last"] = {"value": row["auction_volume_ratio"], "at": state["received"].isoformat()}
+        ratio, ratio_source, ratio_age, ratio_from = self._volume_ratio_value(state)
+        state["volume_ratio_source"] = ratio_source
+        state["volume_ratio_age_seconds"] = ratio_age
+        state["volume_ratio_carried_from"] = ratio_from
+        values["volume_ratio"] = ratio
+        if ratio is not None:
+            scores["volume_ratio"] = clamp(100 * math.log1p(ratio) / math.log(11))
         continuity = strict_continuity(context)
         if continuity is not None:
             values["continuity"] = continuity
@@ -406,6 +447,10 @@ class AuctionEngine:
             flags = ["接口未公开行情发生时间；上游实时延迟未知"]
             if state["phase"] == "cancellable":
                 flags.append("09:20 前可撤单，当前为试探性强弱")
+            if state["volume_ratio_source"] == "carried" and state["values"].get("volume_ratio") is not None:
+                carried_at = state["volume_ratio_carried_from"] or ""
+                minutes = round((state["volume_ratio_age_seconds"] or 0) / 60, 1)
+                flags.append(f"竞价量比实时阶段缺失，按有界携带使用 {carried_at} 的值（约 {minutes} 分钟前，同一会话内）")
             if coverage < .999:
                 flags.append("部分因子缺失；按可用权重归一化，需结合覆盖率比较")
             if stale:
@@ -442,6 +487,10 @@ class AuctionEngine:
                     "score": round(factor_score, 4) if factor_score is not None else None,
                     "weight": weight, "available": factor_score is not None,
                     "contribution": round(factor_score * weight / coverage, 4) if factor_score is not None and coverage else None,
+                    "value_source": state["volume_ratio_source"] if key == "volume_ratio" else None,
+                    "value_age_seconds": round(state["volume_ratio_age_seconds"], 3)
+                    if key == "volume_ratio" and state["volume_ratio_age_seconds"] is not None else None,
+                    "carried_from": state["volume_ratio_carried_from"] if key == "volume_ratio" else None,
                 }
             row.update({
                 "rank": None, "score": round(raw_score, 4) if eligible else None,
@@ -480,6 +529,8 @@ class AuctionEngine:
         rows = self.rankings()
         scored = [row for row in rows if row["score"] is not None]
         return {
+            "volume_ratio_carried_count": sum(1 for state in self._states.values()
+                                              if state.get("volume_ratio_source") == "carried"),
             "session_date": self.session_date, "symbol_count": len(rows), "scored_count": len(scored),
             "observation_count": sum(len(items) for items in self.history.values()),
             "batches": self._batches, "not_ready_batches": self._not_ready_batches,

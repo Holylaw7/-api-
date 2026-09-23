@@ -74,7 +74,8 @@ def _recorded(decision, day, checkpoint, now):
                 if factor_weight is None or abs(factor_weight - weights[factor]) > 1e-9:
                     return None
                 row["factors"][factor] = {key: copy.deepcopy(source.get(key)) for key in
-                                            ("label", "value", "score", "weight", "available", "contribution")}
+                                            ("label", "value", "score", "weight", "available", "contribution",
+                                             "value_source", "value_age_seconds", "carried_from")}
             row["label"] = None
             result.append(row)
         return {"rows": result, "weights": weights, "captured_at": captured.isoformat(),
@@ -182,8 +183,30 @@ def _field_coverage(batches, day, codes):
                                 "last_value_at": max(moments).isoformat() if moments else None}
         checkpoints[checkpoint] = per_field
     return {"definition": ("按本机原始批次统计上游 item 键的可得性；键缺失与 null 都不补造，"
-                           "与官方文档字段名逐一对应，用于区分上游停发本机解析失败。"),
+                           "与官方文档字段名逐一对应，用于区分上游停发本机解析失败。"
+                           "`volume_ratio_carried_rows`另记录该时点有多少行按 600 秒内的有界携带使用竞价量比。"),
             "batches": seen, "fields": stats, "checkpoints": checkpoints}
+
+
+def _tag_carried_rows(value):
+    """Record how many rows used the bounded carry for the auction volume ratio."""
+    coverage = value.get("field_coverage")
+    if not isinstance(coverage, dict):
+        return
+    checkpoints = coverage.setdefault("checkpoints", {})
+    for session in value.get("sessions", []):
+        if not isinstance(session, dict):
+            continue
+        rows = session.get("rows") if isinstance(session.get("rows"), list) else []
+        carried = 0
+        for row in rows:
+            factors = row.get("factors") if isinstance(row, dict) and isinstance(row.get("factors"), dict) else {}
+            source = factors.get("volume_ratio") if isinstance(factors.get("volume_ratio"), dict) else {}
+            if source.get("value_source") == "carried":
+                carried += 1
+        entry = checkpoints.setdefault(session.get("checkpoint"), {})
+        if isinstance(entry, dict):
+            entry["volume_ratio_carried_rows"] = carried
 
 
 def _write_once(path, content):
@@ -327,6 +350,14 @@ def render_daily(record):
                 entry = ((checkpoints.get(checkpoint) or {}).get(field) or {})
                 cells.append(f"{entry.get('with_value')}/{entry.get('candidate_count')}")
             lines.append("| " + " | ".join(_cell(value) for value in cells) + " |")
+        carried = []
+        for checkpoint in CHECKPOINTS:
+            entry = ((checkpoints.get(checkpoint) or {}).get("auction_volume_ratio") or {})
+            rides = (checkpoints.get(checkpoint) or {}).get("volume_ratio_carried_rows")
+            if rides:
+                carried.append(f"{checkpoint} 有 {rides} 只按 600 秒内同会话有界携带使用竞价量比")
+        if carried:
+            lines += [*["- " + _cell(text) for text in carried], ""]
         lines.append("")
     lines += ["## 数据边界", "", *["- " + _cell(value) for value in record["warnings"]], "",
               "完整 JSON 保留每股七项因子、缺失与原权重；原始批次留在本机 SQLite，可用批次 SHA-256 对照。",
@@ -444,6 +475,7 @@ class DailyValidation:
                 value["warnings"].append("部分时点没有批次原权重，已回退当时清单权重；这是旧记录的受限复原。")
             if any(session["method"] == "replayed" for session in sessions):
                 value["warnings"].append("部分时点没有合格原始排名，保存的是所标识引擎的重放评分，不宣称是当时已发布的原评分。")
+            _tag_carried_rows(value)
             value["frozen_id"] = _digest(value)[:24]
             _cancel(should_stop)
             _write_once(path, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
@@ -609,6 +641,7 @@ class DailyValidation:
                      "warnings": ["本版本按当日原始批次与当时权重在新的引擎源码下重放，不是当时页面已发布的原分。",
                                   f"原冻结档案 {frozen['frozen_id']} 保持不变，仍保存在 {day}-auction.json 内。",
                                   "只有出现可解释的归一化或实现缺陷时才创建校正版本；校正不能改写历史分数。"]}
+            _tag_carried_rows(value)
             _write_once(target, json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
             saved = self._read(target)
             _write_once(target.with_suffix(".md"), render_daily(saved))
