@@ -250,6 +250,38 @@ class ResearchServiceTests(unittest.TestCase):
         research.assert_not_called()
         self.assertEqual(self.service.review["date"], DAY)
 
+    def test_service_restart_route_needs_an_explicit_restart_entry(self):
+        server = LocalServer(("127.0.0.1", 0), self.service)
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        base = f"http://127.0.0.1:{server.server_port}"
+
+        def post(path, body):
+            request = urllib.request.Request(base + path, data=json.dumps(body).encode(),
+                headers={"Content-Type": "application/json", "X-Local-App": "auction-lab"})
+            return opener.open(request, timeout=5)
+
+        self.service.running = True
+        try:
+            with self.assertRaises(urllib.error.HTTPError) as error:
+                post("/api/service/restart", {})
+            self.assertEqual(error.exception.code, 400)
+            self.assertIn("未提供自动重启入口", error.exception.read().decode("utf-8"))
+            self.assertTrue(self.service.running, "拒绝时不能停止采集")
+            restarted = threading.Event()
+            server.restart = lambda auto_start: restarted.set()
+            with post("/api/service/restart", {}) as response:
+                payload = json.load(response)
+            self.assertTrue(payload["ok"])
+            self.assertIs(payload["restarting"], True)
+            self.assertTrue(restarted.wait(3), "本机重启入口应被触发")
+            self.assertFalse(self.service.running, "请求重启后应停止采集")
+        finally:
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+
     def test_research_http_routes_and_import_body_size_limits(self):
         self.service.research_library.run(self.service.config["weights"], NOW)
         server = LocalServer(("127.0.0.1", 0), self.service)

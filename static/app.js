@@ -1749,6 +1749,41 @@
     event.preventDefault();
     await addWatchlist($('watchlist-batch').value, event.submitter);
   });
+  async function restartService() {
+    const button = $('service-restart');
+    if (!button || button.disabled) return;
+    const confirmed = window.confirm('重启本机服务以加载新的代码与配置？\n\n· 会先停止当前采集（原始批次已落盘，重启后可用同日恢复）\n· 09:10—09:26 或后台任务运行时会拒绝\n· 约 3—5 秒不可用，随后页面自动重连并刷新');
+    if (!confirmed) return;
+    button.disabled = true;
+    text('service-restart-status', '正在请求重启…');
+    try {
+      const result = await api('/api/service/restart', {});
+      text('service-restart-status', result.message || '服务正在重启…');
+    } catch (error) {
+      text('service-restart-status', `重启未执行：${error.message}`);
+      button.disabled = false;
+      return;
+    }
+    const deadline = Date.now() + 30000;
+    const poll = async () => {
+      try {
+        const response = await fetch('/api/health', {cache: 'no-store'});
+        if (response.ok) {
+          const health = await response.json();
+          if (health && health.ok) { text('service-restart-status', '服务已重启，正在刷新页面…'); window.location.reload(); return; }
+        }
+      } catch (error) { /* 重启期间连接失败属正常，继续等待 */ }
+      if (Date.now() > deadline) {
+        text('service-restart-status', '等待超时：请双击 启动系统.cmd 重新启动，再刷新页面。');
+        button.disabled = false;
+        return;
+      }
+      window.setTimeout(poll, 1000);
+    };
+    window.setTimeout(poll, 1200);
+  }
+
+  $('service-restart').addEventListener('click', restartService);
   $('runtime-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     const watchlist = [...new Set($('watchlist').value.split(/[\s,，;；]+/).map((value) => value.trim().toUpperCase()).filter(Boolean))];

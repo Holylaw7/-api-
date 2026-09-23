@@ -60,6 +60,7 @@ GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: 
 | POST路径 | JSON请求体及作用 |
 | --- | --- |
 | `/api/start`、`/api/stop`、`/api/prepare` | `{}`；开始/停止调度、后台准备 |
+| `/api/service/restart` | `{}`；`Service.restart_prepare()` 先校验：09:10–09:26 拒绝、任一同名job为running拒绝；通过后`stop()`并返回`{ok,restarting,mode,message}`。处理器先回响应，再由**非daemon**后台线程关闭监听socket、关闭Store、派生新的`run.py`（日志追加`data/startup.log`、隐藏窗口、`[restart]`诊断行）并`os._exit(0)`；线程必须非daemon，否则`serve_forever`返回后主线程结束会把线程杀掉、子进程无法派生。`serve()`对绑定端口做最多8秒有界重试。`LocalServer(restart=None)`时端点返回400“未提供自动重启入口”，测试注入回调以验证触发但不真正退出进程；重启不迁移或改写任何证据，未采集数据不补造 |
 | `/api/review` | `{date?:'YYYY-MM-DD'}`，只接受已收盘交易日 |
 | `/api/reports/load` | `{date:'YYYY-MM-DD'}`；读取本机实盘历史报告，禁止演示中读取或复盘生成过程中切换，不请求行情 |
 | `/api/reports/save` | `{date?,include_ai?:false,provider?,review_id?,baseline?}`；原子保存Markdown，include_ai必须为JSON布尔值；返回文件信息及校验下载地址 |

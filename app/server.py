@@ -1,5 +1,8 @@
 import json
 import mimetypes
+import os
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,8 +20,9 @@ class LocalServer(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, address, service):
+    def __init__(self, address, service, restart=None):
         self.service = service
+        self.restart = restart
         super().__init__(address, Handler)
 
 
@@ -272,6 +276,17 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(dict(saved, ok=True, message='Markdown 已保存在本机报告目录',
                                 download_url='/api/reports/download?'+urlencode(query)))
                 return
+            elif path == '/api/service/restart':
+                if self.server.restart is None:
+                    raise ValueError('当前进程未提供自动重启入口，请双击 启动系统.cmd 重启')
+                result = service.restart_prepare()
+                self._json(dict(result, ok=True))
+                if result.get('restarting'):
+                    # 必须是非 daemon 线程：shutdown() 会让 serve_forever 返回，
+                    # 主线程随后结束；daemon 线程会被直接杀掉，子进程就派生不出来。
+                    threading.Thread(target=self.server.restart,
+                                     args=(bool(result.get('auto_start')),), daemon=False).start()
+                return
             elif path == '/api/config':
                 service.update_config(body)
             elif path == '/api/watchlist/add':
@@ -334,9 +349,63 @@ class Handler(BaseHTTPRequestHandler):
             self._json({'ok':False,'message':'操作未完成，请检查服务状态'},500)
 
 
+def _restart_service(server, service, port, auto_start=True):
+    """Replace this process with a fresh one so new code and config take effect."""
+    time.sleep(0.4)  # 让本次 HTTP 响应先发出去
+    try:
+        server.shutdown()
+        server.server_close()
+    except Exception:
+        pass
+    try:
+        service.stop()
+        service.store.close()
+    except Exception:
+        pass
+    time.sleep(0.5)  # 等监听端口释放
+    log = ROOT / 'data' / 'startup.log'
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    child = None
+    try:
+        with log.open('ab') as stream:
+            command = [sys.executable, str(ROOT / 'run.py'), '--port', str(port)]
+            if not auto_start:
+                command.append('--no-auto-start')
+            stream.write(f'\n[restart] spawn {command}\n'.encode('utf-8'))
+            stream.flush()
+            child = subprocess.Popen(command,
+                                     cwd=str(ROOT), stdout=stream, stderr=stream, stdin=subprocess.DEVNULL,
+                                     creationflags=flags, start_new_session=os.name != 'nt')
+            stream.write(f'[restart] spawned pid={child.pid}\n'.encode('utf-8'))
+            stream.flush()
+        time.sleep(1.5)
+        exit_code = child.poll()
+        with log.open('ab') as stream:
+            stream.write(f'[restart] after 1.5s alive={exit_code is None} exit={exit_code}\n'.encode('utf-8'))
+    except Exception as exc:
+        try:
+            with log.open('ab') as stream:
+                stream.write(f'[restart] failed {type(exc).__name__}: {exc}\n'.encode('utf-8'))
+        except Exception:
+            pass
+    finally:
+        os._exit(0)
+
+
 def serve(port=8765, *, auto_start=True):
     service = Service()
-    server = LocalServer(('127.0.0.1',port),service)
+    # A page-triggered restart spawns this process while the old socket is still
+    # being released, so retry the bind for a bounded moment instead of dying.
+    deadline = time.monotonic() + 8
+    while True:
+        try:
+            server = LocalServer(('127.0.0.1',port),service)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.4)
+    server.restart = lambda auto_start=True: _restart_service(server, service, port, auto_start)
     if auto_start and finance_key():
         service.start()
     try:

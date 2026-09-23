@@ -1538,3 +1538,26 @@ class Service:
         self.running = False
         self.shutdown.set()
         self.touch()
+
+    def restart_prepare(self):
+        """Quiesce this process so the page button can replace it with a fresh one.
+
+        The caller (local HTTP handler) answers first and only then closes the
+        socket, spawns ``run.py`` again and exits, so the new process reloads
+        both the Python code and ``data/config.json``.  Nothing here touches
+        evidence: batches are already persisted and the same-day restore logic
+        can rebuild the session after the restart.
+        """
+        current = now_sh()
+        if '09:10' <= current.strftime('%H:%M') <= '09:26':
+            raise ValueError('09:10–09:26 优先保障竞价采集，请在此时段外重启服务')
+        running = sorted(name for name, job in self.jobs.items()
+                         if isinstance(job, dict) and job.get('status') == 'running')
+        if running:
+            raise ValueError('后台任务正在运行（' + '、'.join(running) + '），请等任务完成后再重启')
+        was_running = bool(self.running)
+        self.stop()
+        return {'restarting': True, 'mode': self.mode, 'config_file': 'data/config.json',
+                'was_running': was_running, 'auto_start': was_running,
+                'message': ('正在重启本机服务以加载新的代码与配置；约 3—5 秒后自动恢复，页面会自动重连并刷新。'
+                            '若 10 秒后仍未恢复，请双击 启动系统.cmd。')}

@@ -99,6 +99,29 @@ class ServiceTest(unittest.TestCase):
         self.service.collect_cycle('final',clock=lambda:instant(m=25))
         self.assertTrue(self.service.finalized)
 
+    def test_restart_prepare_guards_and_stops_collection(self):
+        service = self.service
+        service.running = True
+        with patch('app.service.now_sh', return_value=instant(m=20)):
+            with self.assertRaises(ValueError) as error:
+                service.restart_prepare()
+        self.assertIn('09:10', str(error.exception))
+        self.assertTrue(service.running, '保护时段拒绝时不能停止采集')
+        service.jobs['review'] = {'status': 'running'}
+        with self.assertRaises(ValueError) as error:
+            service.restart_prepare()
+        self.assertIn('后台任务', str(error.exception))
+        self.assertTrue(service.running)
+        service.jobs['review'] = {'status': 'done'}
+        service.running = True
+        result = service.restart_prepare()
+        self.assertIs(result['restarting'], True)
+        self.assertIs(result['auto_start'], True)
+        self.assertFalse(service.running)
+        stopped = service.restart_prepare()
+        self.assertIs(stopped['auto_start'], False, '原本已停止时重启不应自动开始采集')
+        self.assertIn('重启', result['message'])
+
     def test_final_stage_keeps_refreshing_until_late_final_values_arrive(self):
         service = self.service
         service.config['batch_size'] = 10
