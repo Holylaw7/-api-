@@ -36,18 +36,60 @@ class Handler(BaseHTTPRequestHandler):
         port = self.server.server_port
         allowed = {f'127.0.0.1:{port}', f'localhost:{port}'}
         if self.headers.get('Host') not in allowed:
-            self._json({'ok':False,'message':'仅允许本机访问'},403)
+            self._reject({'ok':False,'message':'仅允许本机访问'})
             return False
         origin = self.headers.get('Origin')
         if origin and origin not in {'http://'+h for h in allowed}:
-            self._json({'ok':False,'message':'跨站请求已拒绝'},403)
+            self._reject({'ok':False,'message':'跨站请求已拒绝'})
             return False
         if mutation and self.headers.get('X-Local-App') != 'auction-lab':
-            self._json({'ok':False,'message':'缺少本机操作标记'},403)
+            self._reject({'ok':False,'message':'缺少本机操作标记'})
             return False
         return True
 
-    def _json(self, value, status=200, attachment=None):
+    def _drain_body(self, limit=1024 * 1024, timeout=.5):
+        """Drop whatever the client actually sent, without ever blocking on it.
+
+        Windows turns "close with unread request data" into a TCP reset, which
+        can make a browser or test client lose the 403/413 response entirely.
+        The response is written first, then at most ``limit`` bytes are read with
+        a short socket timeout, so a client that declares a body without sending
+        it (or a 5 MiB claim with an empty body) still receives the rejection.
+        """
+        try:
+            remaining = min(max(0, int(self.headers.get('Content-Length','0') or 0)), limit)
+        except (TypeError, ValueError):
+            remaining = 0
+        if remaining <= 0:
+            return
+        previous = None
+        try:
+            previous = self.connection.gettimeout()
+            self.connection.settimeout(timeout)
+        except (AttributeError, OSError):
+            previous = None
+        try:
+            while remaining > 0:
+                try:
+                    chunk = self.rfile.read(min(65536, remaining))
+                except (TimeoutError, OSError):
+                    break
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        finally:
+            if previous is not None:
+                try:
+                    self.connection.settimeout(previous)
+                except OSError:
+                    pass
+
+    def _reject(self, value, status=403):
+        """Write the rejection first, then drain a bounded body and close."""
+        self._json(value, status, close=True)
+        self._drain_body()
+
+    def _json(self, value, status=200, attachment=None, close=False):
         data = json.dumps(value, ensure_ascii=False, allow_nan=False).encode('utf-8')
         self.send_response(status)
         self.send_header('Content-Type','application/json; charset=utf-8')
@@ -56,6 +98,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Content-Type-Options','nosniff')
         if attachment:
             self.send_header('Content-Disposition',f'attachment; filename="{attachment}"')
+        if close:
+            self.send_header('Connection','close')
+            self.close_connection = True
         self.end_headers()
         self.wfile.write(data)
 
@@ -216,7 +261,7 @@ class Handler(BaseHTTPRequestHandler):
             path = urlsplit(self.path).path
             length = int(self.headers.get('Content-Length','0'))
             if length < 0 or length > (MAX_IMPORT_BYTES if path == '/api/research/import' else 65536):
-                self._json({'ok':False,'message':'请求过大'},413)
+                self._reject({'ok':False,'message':'请求过大'},413)
                 return
             body = json.loads(self.rfile.read(length) or b'{}')
             if not isinstance(body,dict):

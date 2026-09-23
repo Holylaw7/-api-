@@ -79,7 +79,7 @@ GET `/api/state`和SSE `/api/events`提供相同公开状态；SSE格式为`id: 
 | `/api/sectors/search` | `{query:'名称或完整代码'}`；1—80字，官方行业/概念完整目录匹配，返回ok/query/matches/exact/unmatched_note |
 | `/api/sectors/research` | `{codes:[完整官方代码],date,review_id}`；1—3个唯一代码，异步取数，返回started；不调用模型 |
 
-响应为`{ok,message,...}`；review、reports/enrich、watchlist/add、stocks/analyze、trends/refresh、llm及llm-test另含started，false表示同名任务正在运行。仅允许本机Host、同源及`X-Local-App: auction-lab`。禁止GET暴露密钥、任意文件读取或向不同服务转发旧密钥。股票代码必须是字符串，保留前导零；裸代码不能仅凭已有完整代码缓存假定唯一。
+被拒绝的POST（Host/Origin/`X-Local-App`不合规或请求过大）先写出403/413响应，再做**有界且不阻塞**的请求体丢弃（最多1MiB、0.5秒socket超时）并带`Connection: close`关闭；Windows在未读请求体上关闭连接会产生TCP RST，客户端可能只看到连接中断而读不到拒绝原因，这条顺序用于避免该现象。响应为`{ok,message,...}`；review、reports/enrich、watchlist/add、stocks/analyze、trends/refresh、llm及llm-test另含started，false表示同名任务正在运行。仅允许本机Host、同源及`X-Local-App: auction-lab`。禁止GET暴露密钥、任意文件读取或向不同服务转发旧密钥。股票代码必须是字符串，保留前导零；裸代码不能仅凭已有完整代码缓存假定唯一。
 
 | GET路径 | 查询参数与返回 |
 | --- | --- |
